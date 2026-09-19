@@ -1,0 +1,598 @@
+"""
+main.py — Longwave Pico transmitter, boot entry point.
+
+Two ways to set the start time, matching how you'll actually use this:
+
+  1. PC-connected: run pc_sync.py on a computer plugged into the Pico's
+     USB port. It sends a single line over serial the instant you press
+     Enter — "START <PROTOCOL> <epoch_seconds>" — and this file starts
+     transmitting immediately upon receiving it, so the Enter keypress
+     (timed against your PC's clock, or against you watching a separate
+     accurate clock and hitting Enter on the tick) becomes second zero
+     of the transmission.
+
+  2. Standalone (no PC): this file opens a Wi-Fi access point named
+     "LongwavePico" and serves a small web page. Type in the protocol
+     and the target date/time (seconds are always :00), then watch a
+     clock and tap "GO" the instant its second hand reaches 12 for that
+     minute — the moment the Pico receives that request becomes second
+     zero, the same way the PC keypress does in option 1.
+
+Which mode this boots into is controlled by a flag file rather than a
+timed race, since a fixed "wait a few seconds for serial, then give up"
+window is fragile in practice — typing in a date/time by hand in
+pc_sync.py can easily take longer than any short window, which would
+wrongly kick the Pico into Wi-Fi mode mid-setup. Instead:
+
+  - By default (no flag file present), this boots into serial mode and
+    waits indefinitely for pc_sync.py.
+  - To use standalone Wi-Fi mode instead, create an empty file named
+    "wifi_mode.txt" on the Pico's filesystem once (e.g. via Thonny) —
+    from then on it always boots straight into Wi-Fi mode. Delete the
+    file to go back to serial mode.
+"""
+
+import sys
+import time
+import network
+import socket
+import os
+import machine
+
+import timecode
+import transmitter
+
+AP_SSID = "LongwavePico"
+AP_PASSWORD = ""  # open network — this is a local utility, not a security boundary
+AP_IP = "192.168.4.1"
+
+WIFI_MODE_FLAG_FILE = "wifi_mode.txt"
+
+# Tracks whether the Pico's clock has been set from a real source (a
+# connecting phone's auto-sync, or a manual entry) since the last power
+# cycle. The RP2040/RP2350 has no battery-backed RTC, so this always
+# starts False on a fresh boot — see the module docstring above.
+_clock_synced = False
+_last_sync_epoch = None  # Pico's own utime.time() reading at last sync
+
+
+def _wifi_mode_requested():
+    try:
+        os.stat(WIFI_MODE_FLAG_FILE)
+        return True
+    except OSError:
+        return False
+
+
+def set_pico_clock(epoch_s):
+    """Set the Pico's hardware RTC to the given UTC epoch second (Unix
+    epoch — confirmed the rp2 MicroPython port uses 1970, same as the
+    epoch timecode.py already assumes throughout, so no conversion is
+    needed here). Once set, utime.time() keeps advancing on its own from
+    this point, independent of Wi-Fi/serial staying connected."""
+    global _clock_synced, _last_sync_epoch
+    y, mo, d, hh, mm, ss, wd, _yday = time.gmtime(epoch_s)
+    # machine.RTC().datetime() tuple order: (year, month, day, weekday,
+    # hours, minutes, seconds, subseconds) — note weekday comes before
+    # the time fields here, unlike time.gmtime()'s tuple order.
+    rtc_weekday = wd  # time.gmtime() weekday is already 0=Mon..6=Sun, matching RTC's expectation
+    machine.RTC().datetime((y, mo, d, rtc_weekday, hh, mm, ss, 0))
+    _clock_synced = True
+    _last_sync_epoch = time.time()
+
+
+# ---------------------------------------------------------------------------
+# Serial command listener (for pc_sync.py)
+# ---------------------------------------------------------------------------
+
+
+def _handle_serial_command(line):
+    """Parse and execute a line like 'START DCF77 1789673999' or 'STOP'.
+    The epoch second in a START command is captured by pc_sync.py at the
+    moment of the user's Enter keypress, so we start transmitting
+    immediately — no further delay — to keep that moment as second zero."""
+    parts = line.strip().split()
+    if not parts:
+        return "ERR empty command"
+    cmd = parts[0].upper()
+
+    if cmd == "STOP":
+        transmitter.stop()
+        return "OK stopped"
+
+    if cmd == "START" and len(parts) == 3:
+        protocol = parts[1].upper()
+        try:
+            epoch_s = int(parts[2])
+        except ValueError:
+            return "ERR bad epoch value"
+        if protocol not in timecode.ENCODERS:
+            return "ERR unknown protocol " + protocol
+        if transmitter.is_transmitting():
+            return "ERR already transmitting — send STOP first"
+        ok = transmitter.start(protocol, epoch_s)
+        return "OK started " + protocol if ok else "ERR could not start"
+
+    return "ERR unrecognized command: " + line
+
+
+def run_serial_mode():
+    """Serial command loop: listens indefinitely for START/STOP lines
+    from pc_sync.py. This is the default boot mode."""
+    print("Longwave Pico — serial command mode.")
+    print("Waiting for commands from pc_sync.py (START <PROTOCOL> <epoch>, STOP)...")
+    try:
+        import uselect as select
+    except ImportError:
+        import select
+    poller = select.poll()
+    poller.register(sys.stdin, select.POLLIN)
+    line = ""
+    while True:
+        events = poller.poll(100)
+        if events:
+            ch = sys.stdin.read(1)
+            if ch in ("\n", "\r"):
+                if line:
+                    resp = _handle_serial_command(line)
+                    print(resp)
+                    line = ""
+            else:
+                line += ch
+
+
+# ---------------------------------------------------------------------------
+# Wi-Fi AP + web UI fallback (standalone, no PC needed)
+# ---------------------------------------------------------------------------
+
+def start_ap():
+    ap = network.WLAN(network.AP_IF)
+    ap.active(True)
+    ap.config(ssid=AP_SSID, password=AP_PASSWORD, security=0)
+    for _ in range(20):
+        if ap.active():
+            break
+        time.sleep(0.1)
+    print("AP started:", AP_SSID, "— connect and open http://" + AP_IP)
+    return ap
+
+
+PROTOCOL_LABELS = {
+    "DCF77": "DCF77 — Germany, 77.5 kHz",
+    "MSF": "MSF — UK, 60 kHz",
+    "WWVB": "WWVB — USA, 60 kHz (UTC)",
+    "JJY": "JJY — Japan, 40/60 kHz",
+    "BPC": "BPC — China, 68.5 kHz",
+}
+
+
+def build_page(status_msg="", error_msg=""):
+    transmitting = transmitter.is_transmitting()
+    state_text = "TRANSMITTING" if transmitting else "STOPPED"
+    state_color = "#22c55e" if transmitting else "#94a3b8"
+    current_proto = transmitter.current_protocol() or ""
+
+    options_html = ""
+    for proto, label in PROTOCOL_LABELS.items():
+        selected = " selected" if proto == current_proto else ""
+        options_html += '<option value="%s"%s>%s</option>\n' % (proto, selected, label)
+
+    now = time.localtime()
+    default_date = "%04d-%02d-%02d" % (now[0], now[1], now[2])
+    default_time = "%02d:%02d" % (now[3], now[4])
+
+    start_disabled = "disabled" if transmitting else ""
+    stop_disabled = "disabled" if not transmitting else ""
+
+    status_block = ('<p class="status-msg">%s</p>' % status_msg) if status_msg else ""
+    error_block = ('<p class="error-msg">%s</p>' % error_msg) if error_msg else ""
+
+    offset_options_html = ""
+    for h in range(-12, 15):
+        label = "UTC" if h == 0 else ("UTC+%d" % h if h > 0 else "UTC%d" % h)
+        selected = " selected" if h == 0 else ""
+        offset_options_html += '<option value="%d"%s>%s</option>\n' % (h, selected, label)
+
+    return """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Longwave Pico</title>
+<style>
+  * {{ box-sizing: border-box; margin: 0; padding: 0; }}
+  body {{
+    background: #0a0906; color: #e8e4d9;
+    font-family: 'IBM Plex Mono', 'SF Mono', Consolas, monospace;
+    display: flex; justify-content: center; align-items: flex-start;
+    min-height: 100vh; padding: 2rem 1rem;
+  }}
+  .card {{
+    background: #14120f; border: 1px solid #2c2820; border-radius: 0.5rem;
+    padding: 1.75rem; width: 100%; max-width: 480px;
+  }}
+  h1 {{ font-size: 1.3rem; font-weight: 700; margin-bottom: 0.2rem; color: #e8a33d; }}
+  .subtitle {{ color: #948d7c; font-size: 0.8rem; margin-bottom: 1.25rem; }}
+  .badges {{ display: flex; gap: 0.5rem; margin-bottom: 1.25rem; flex-wrap: wrap; }}
+  .badge {{
+    display: inline-block; padding: 0.3rem 0.9rem; border-radius: 999px;
+    font-weight: 700; font-size: 0.75rem; background: #0a0906;
+    letter-spacing: 0.05em; border: 2px solid #94a3b8; color: #94a3b8;
+  }}
+  .state-badge {{ color: {state_color}; border-color: {state_color}; }}
+  .sync-badge.synced {{ color: #22c55e; border-color: #22c55e; }}
+  .sync-badge.syncing {{ color: #e8a33d; border-color: #e8a33d; }}
+  .sync-badge.failed {{ color: #e07a5f; border-color: #e07a5f; }}
+  .section {{ margin-bottom: 1.1rem; }}
+  label {{ display: block; font-size: 0.75rem; color: #948d7c; margin-bottom: 0.3rem; }}
+  select, input {{
+    width: 100%; padding: 0.55rem 0.7rem; background: #1c1a15; color: #e8e4d9;
+    border: 1px solid #2c2820; border-radius: 0.4rem; font-size: 0.95rem;
+    font-family: inherit;
+  }}
+  select:disabled, input:disabled {{ opacity: 0.4; }}
+  .row2 {{ display: flex; gap: 0.6rem; }}
+  .row2 > div {{ flex: 1; }}
+  .go-btn {{
+    width: 100%; padding: 1rem; margin-top: 0.5rem; font-size: 1rem; font-weight: 700;
+    letter-spacing: 0.04em; background: #e8a33d; color: #1a1204; border: none;
+    border-radius: 0.4rem; cursor: pointer;
+  }}
+  .go-btn:disabled {{ background: #2c2820; color: #948d7c; }}
+  .stop-btn {{
+    width: 100%; padding: 0.7rem; margin-top: 0.6rem; font-weight: 700;
+    background: #7a2020; color: #fff; border: none; border-radius: 0.4rem; cursor: pointer;
+  }}
+  .stop-btn:disabled {{ background: #2c2820; color: #948d7c; }}
+  .hint {{
+    background: #1c1a15; border: 1px solid #2c2820; border-radius: 0.4rem;
+    padding: 0.7rem 0.9rem; font-size: 0.78rem; color: #948d7c; line-height: 1.6;
+    margin: 0.9rem 0;
+  }}
+  .status-msg {{ color: #7ec98f; font-size: 0.8rem; margin-top: 0.5rem; }}
+  .error-msg {{ color: #e07a5f; font-size: 0.8rem; margin-top: 0.5rem; }}
+  hr {{ border: none; border-top: 1px solid #2c2820; margin: 1rem 0; }}
+  details {{ margin-top: 0.4rem; }}
+  summary {{
+    cursor: pointer; font-size: 0.78rem; color: #948d7c; padding: 0.4rem 0;
+  }}
+  #sync-time {{ font-size: 0.72rem; color: #6b6455; margin-top: 0.3rem; }}
+</style>
+</head>
+<body>
+<div class="card">
+  <h1>Longwave Pico</h1>
+  <p class="subtitle">Standalone time-code transmitter — GP0 antenna</p>
+  <div class="badges">
+    <div class="badge state-badge">{state_text}</div>
+    <div class="badge sync-badge syncing" id="sync-badge">SYNCING…</div>
+  </div>
+  <div id="sync-time"></div>
+
+  <form method="POST" action="/start" id="start-form">
+    <div class="section">
+      <label for="protocol">Protocol</label>
+      <select name="protocol" id="protocol" {start_disabled}>
+        {options_html}
+      </select>
+    </div>
+
+    <div class="hint" id="auto-hint">
+      This page reads your phone's own clock automatically — no need to
+      watch a clock or tap on a tick. Once synced (above), just pick a
+      protocol and hit Start.
+    </div>
+
+    <button class="go-btn" type="submit" id="start-btn" {start_disabled}>Start transmitting</button>
+    {status_block}{error_block}
+
+    <details>
+      <summary>Manual time entry (only if auto-sync fails)</summary>
+      <div class="row2 section">
+        <div>
+          <label for="date">Date to transmit</label>
+          <input type="date" name="date" id="date" value="{default_date}">
+        </div>
+        <div>
+          <label for="time">Time (HH:MM), your local time</label>
+          <input type="time" name="time" id="time" value="{default_time}">
+        </div>
+      </div>
+      <div class="section">
+        <label for="offset">Your current UTC offset (e.g. UTC-4 for EDT)</label>
+        <select name="offset" id="offset">
+          {offset_options_html}
+        </select>
+      </div>
+      <div class="hint">
+        Only needed if the automatic sync above fails. Enter the date/time
+        exactly as your own clock reads right now, pick your current UTC
+        offset, then hit Start immediately.
+      </div>
+    </details>
+  </form>
+
+  <hr>
+
+  <form method="POST" action="/stop">
+    <button class="stop-btn" type="submit" {stop_disabled}>Stop transmitting</button>
+  </form>
+</div>
+
+<script>
+// Automatic time sync: measure round-trip time to the Pico and estimate
+// its clock offset from this device's own (accurate, network-synced)
+// clock, the same way NTP does it over a single local hop. Runs once on
+// page load; no button needed.
+async function syncClock() {{
+  const badge = document.getElementById('sync-badge');
+  const timeEl = document.getElementById('sync-time');
+  try {{
+    // First round trip: just measure latency to this specific Pico over
+    // this specific Wi-Fi link (the /sync response body isn't otherwise
+    // used — what matters is timing the round trip itself).
+    const measureStart = Date.now();
+    await fetch('/sync', {{cache: 'no-store'}});
+    const roundTripMs = Date.now() - measureStart;
+
+    // Second request: tell the Pico what time it is right now, adjusted
+    // for half the measured round-trip (the Pico will receive this
+    // request roughly that long after we send it, on a symmetric link).
+    const sendAt = Date.now();
+    const correctedEpochS = Math.round((sendAt + roundTripMs / 2) / 1000);
+    const setResp = await fetch('/settime', {{
+      method: 'POST',
+      headers: {{'Content-Type': 'application/x-www-form-urlencoded'}},
+      body: 'epoch=' + correctedEpochS
+    }});
+    const setData = await setResp.json();
+    if (setData.ok) {{
+      badge.textContent = 'CLOCK SYNCED';
+      badge.className = 'badge sync-badge synced';
+      timeEl.textContent = 'Round-trip: ' + roundTripMs + 'ms';
+      document.getElementById('start-btn').disabled = false;
+    }} else {{
+      throw new Error(setData.error || 'unknown error');
+    }}
+  }} catch (e) {{
+    badge.textContent = 'SYNC FAILED';
+    badge.className = 'badge sync-badge failed';
+    timeEl.textContent = 'Use manual entry below.';
+  }}
+}}
+syncClock();
+</script>
+</body>
+</html>""".format(
+        state_color=state_color, state_text=state_text, options_html=options_html,
+        default_date=default_date, default_time=default_time,
+        offset_options_html=offset_options_html,
+        start_disabled=start_disabled, stop_disabled=stop_disabled,
+        status_block=status_block, error_block=error_block,
+    )
+
+
+def _parse_post_body(body_bytes):
+    result = {}
+    try:
+        for pair in body_bytes.decode().split("&"):
+            if "=" in pair:
+                k, v = pair.split("=", 1)
+                result[k] = v.replace("+", " ").replace("%3A", ":")
+    except Exception:
+        pass
+    return result
+
+
+def _send_response(conn, body, status="200 OK"):
+    if isinstance(body, str):
+        body = body.encode()
+    header = (
+        "HTTP/1.1 " + status + "\r\n"
+        "Content-Type: text/html; charset=utf-8\r\n"
+        "Content-Length: " + str(len(body)) + "\r\n"
+        "Connection: close\r\n\r\n"
+    )
+    conn.send(header.encode())
+    pos = 0
+    while pos < len(body):
+        conn.send(body[pos:pos + 512])
+        pos += 512
+
+
+def _send_redirect(conn, location="/"):
+    header = (
+        "HTTP/1.1 302 Found\r\n"
+        "Location: " + location + "\r\n"
+        "Connection: close\r\n\r\n"
+    )
+    conn.send(header.encode())
+
+
+def _send_json(conn, body_json):
+    body = body_json.encode()
+    header = (
+        "HTTP/1.1 200 OK\r\n"
+        "Content-Type: application/json\r\n"
+        "Content-Length: " + str(len(body)) + "\r\n"
+        "Access-Control-Allow-Origin: *\r\n"
+        "Connection: close\r\n\r\n"
+    )
+    conn.send(header.encode())
+    conn.send(body)
+
+
+def _local_date_time_to_epoch(date_str, time_str, utc_offset_hours):
+    """date_str: 'YYYY-MM-DD', time_str: 'HH:MM', both as the person's own
+    local clock will read them. utc_offset_hours is what they selected in
+    the form (e.g. -4 for EDT). Converts to a UTC epoch: UTC = local -
+    offset. From there, timecode.py derives each protocol's own reference
+    time (CET/BST/UTC/JST/CST) exactly as it always has."""
+    y, mo, d = [int(x) for x in date_str.split("-")]
+    hh, mm = [int(x) for x in time_str.split(":")]
+    local_epoch = timecode.epoch_from_utc_parts(y, mo, d, hh, mm, 0)
+    return local_epoch - utc_offset_hours * 3600
+
+
+def run_web_mode():
+    start_ap()
+    addr = socket.getaddrinfo("0.0.0.0", 80)[0][-1]
+    srv = socket.socket()
+    srv.bind(addr)
+    srv.listen(2)
+    srv.settimeout(0.5)
+    print("HTTP server listening on", AP_IP, ":80")
+
+    status_msg = ""
+    error_msg = ""
+
+    while True:
+        try:
+            conn, _addr = srv.accept()
+        except OSError:
+            continue
+
+        # (transmitter.start(), called below once we've parsed the
+        # request, captures its own precise anchor synchronously before
+        # spawning the transmit thread — see transmitter.py — so the
+        # "tap GO on the tick" instant is captured as close to actual
+        # request arrival as parsing overhead allows.)
+
+        try:
+            request = b""
+            while b"\r\n\r\n" not in request:
+                chunk = conn.recv(256)
+                if not chunk:
+                    break
+                request += chunk
+
+            body = b""
+            if b"Content-Length:" in request:
+                try:
+                    cl_line = [l for l in request.split(b"\r\n") if b"Content-Length:" in l][0]
+                    cl = int(cl_line.split(b":")[1].strip())
+                    header_end = request.index(b"\r\n\r\n") + 4
+                    body = request[header_end:]
+                    while len(body) < cl:
+                        body += conn.recv(cl - len(body))
+                except Exception:
+                    pass
+
+            first_line = request.split(b"\r\n")[0].decode()
+            parts = first_line.split(" ")
+            method = parts[0] if parts else "GET"
+            path_with_query = parts[1] if len(parts) > 1 else "/"
+            path = path_with_query.split("?", 1)[0]
+
+            status_msg = ""
+            error_msg = ""
+
+            if method == "GET" and path in ("/", "/index.html"):
+                _send_response(conn, build_page())
+
+            elif method == "GET" and path == "/sync":
+                # Used purely as a round-trip latency probe by the page's
+                # auto-sync JS (see build_page()) — the response content
+                # itself doesn't matter, only how long the request took.
+                _send_json(conn, '{"ok": true}')
+
+            elif method == "POST" and path == "/settime":
+                params = _parse_post_body(body)
+                try:
+                    corrected_epoch_s = int(params.get("epoch", ""))
+                    set_pico_clock(corrected_epoch_s)
+                    _send_json(conn, '{"ok": true}')
+                except Exception as e:
+                    _send_json(conn, '{"ok": false, "error": "%s"}' % str(e))
+
+            elif method == "GET" and path == "/status":
+                y, mo, d, hh, mm, ss, wd, _yd = time.gmtime()
+                body_json = (
+                    '{"synced": %s, "transmitting": %s, "protocol": "%s", '
+                    '"utc": "%04d-%02d-%02d %02d:%02d:%02d"}'
+                ) % (
+                    "true" if _clock_synced else "false",
+                    "true" if transmitter.is_transmitting() else "false",
+                    transmitter.current_protocol() or "",
+                    y, mo, d, hh, mm, ss,
+                )
+                _send_json(conn, body_json)
+
+            elif method == "POST" and path == "/start":
+                params = _parse_post_body(body)
+                protocol = params.get("protocol", "").strip().upper()
+
+                if transmitter.is_transmitting():
+                    error_msg = "Already transmitting — stop first."
+                    _send_response(conn, build_page(error_msg=error_msg))
+                elif protocol not in timecode.ENCODERS:
+                    error_msg = "Unknown protocol."
+                    _send_response(conn, build_page(error_msg=error_msg))
+                elif not _clock_synced:
+                    error_msg = "Clock not synced yet — reload the page and wait a moment, or enter time manually below."
+                    date_str = params.get("date", "").strip()
+                    time_str = params.get("time", "").strip()
+                    offset_str = params.get("offset", "0").strip()
+                    if date_str and time_str:
+                        try:
+                            utc_offset_hours = int(offset_str)
+                            target_epoch = _local_date_time_to_epoch(date_str, time_str, utc_offset_hours)
+                            set_pico_clock(target_epoch)
+                            ok = transmitter.start(protocol, target_epoch)
+                            if ok:
+                                time.sleep(0.1)
+                                _send_redirect(conn)
+                            else:
+                                error_msg = "Could not start transmission."
+                                _send_response(conn, build_page(error_msg=error_msg))
+                        except Exception:
+                            error_msg = "Could not parse manually-entered date/time."
+                            _send_response(conn, build_page(error_msg=error_msg))
+                    else:
+                        _send_response(conn, build_page(error_msg=error_msg))
+                else:
+                    # Clock is already synced (from the page's automatic
+                    # background sync) — just start transmitting using the
+                    # Pico's own current, already-accurate clock. No manual
+                    # date/time entry or tick-watching needed at all.
+                    target_epoch = time.time()
+                    ok = transmitter.start(protocol, target_epoch)
+                    if ok:
+                        time.sleep(0.1)
+                        _send_redirect(conn)
+                    else:
+                        error_msg = "Could not start transmission."
+                        _send_response(conn, build_page(error_msg=error_msg))
+
+            elif method == "POST" and path == "/stop":
+                transmitter.stop()
+                time.sleep(0.2)
+                _send_redirect(conn)
+
+            else:
+                _send_response(conn, "<h1>404</h1>", status="404 Not Found")
+
+        except Exception as e:
+            print("Request error:", e)
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
+# ---------------------------------------------------------------------------
+# Boot
+# ---------------------------------------------------------------------------
+
+if __name__ == "__main__":
+    print("Longwave Pico booting...")
+    if _wifi_mode_requested():
+        print("wifi_mode.txt found — starting standalone Wi-Fi mode.")
+        run_web_mode()
+    else:
+        print("Serial mode (default). Run pc_sync.py on a connected PC.")
+        print("(To use standalone Wi-Fi mode instead, create an empty file")
+        print(" named 'wifi_mode.txt' on this Pico's filesystem and reboot.)")
+        run_serial_mode()
+
