@@ -117,6 +117,32 @@ routinely takes longer than that, so the Pico would time out and boot
 into Wi-Fi mode mid-setup. A flag file you set once for however you
 actually use the device avoids that race entirely.
 
+## Frequency test mode (for cheap RTL-SDR dongles)
+
+Most of these protocols transmit well below 500 kHz (DCF77 at 77.5 kHz,
+WWVB and MSF at 60 kHz, JJY at 40/60 kHz, BPC at 68.5 kHz) — lower than
+many inexpensive RTL-SDR dongles can actually tune to. Both control
+paths let you shift the whole transmission up in frequency so you can
+verify the real on/off pulse pattern on an SDR, without changing
+anything about the underlying bit timing:
+
+- **Web UI**: expand "Frequency test mode" above the Start button and
+  pick +500 kHz or +1 MHz before hitting Start.
+- **`pc_sync.py`**: you'll be prompted for a frequency offset right
+  after picking a protocol.
+- **Raw serial command**: `START <PROTOCOL> <epoch> <offset_hz>`, e.g.
+  `START DCF77 1789673999 500000`.
+
+With a +500 kHz shift: DCF77 becomes 577.5 kHz, MSF and WWVB become
+560 kHz, JJY becomes 540 kHz, and BPC becomes 568.5 kHz — all
+comfortably within range of a typical RTL-SDR's minimum tunable
+frequency. No real clock will ever hear a shifted signal; this is
+purely a way to confirm the Pico is actually keying the carrier
+correctly before trusting it against real hardware. The web page's
+status badge and `/status` endpoint both show the real transmitting
+frequency whenever a test offset is active, so it's never ambiguous
+which mode you're in.
+
 ## Accuracy notes
 
 `timecode.py` is a direct port of the same encoders used in the

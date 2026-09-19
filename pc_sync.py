@@ -71,6 +71,18 @@ def pick_protocol():
         sys.exit(1)
 
 
+def pick_freq_offset():
+    print("\nFrequency test mode (for SDR reception testing):")
+    print("  [0] Off — transmit on the real frequency")
+    print("  [1] +500 kHz (e.g. DCF77 -> 577.5 kHz, WWVB -> 560 kHz)")
+    print("  [2] +1 MHz")
+    print("No real clock will pick up a shifted signal — this only helps")
+    print("verify the on/off pulse pattern on an SDR that can't tune down")
+    print("to the real frequency. Bit timing is identical either way.")
+    choice = input("Pick an option (default 0): ").strip()
+    return {"1": 500_000, "2": 1_000_000}.get(choice, 0)
+
+
 def get_target_epoch():
     """Returns a UTC epoch second for the transmission's second-zero, and
     a description of how it will be captured."""
@@ -123,6 +135,7 @@ def main():
     print(f"Using port: {port}")
 
     protocol = pick_protocol()
+    freq_offset_hz = pick_freq_offset()
 
     # Open the serial connection BEFORE asking the user to watch a clock
     # and press Enter — opening it after the keypress would add
@@ -141,13 +154,18 @@ def main():
         target_epoch, how = get_target_epoch()
         # Everything above this line (including the Enter keypress inside
         # get_target_epoch) is done. Send immediately.
-        cmd = f"START {protocol} {int(target_epoch)}\n"
+        if freq_offset_hz:
+            cmd = f"START {protocol} {int(target_epoch)} {freq_offset_hz}\n"
+        else:
+            cmd = f"START {protocol} {int(target_epoch)}\n"
         ser.write(cmd.encode())
         ser.flush()
         send_time = time.time()
         resp = ser.readline().decode(errors="replace").strip()
 
     print(f"\nStarting {protocol} transmission — {how}")
+    if freq_offset_hz:
+        print(f"Frequency test mode: shifted +{freq_offset_hz} Hz")
     print(f"Target epoch: {int(target_epoch)}  (PC time at send: {send_time:.3f})")
     print("Pico says:", resp or "(no response — check main.py is running the serial listener)")
     print("\nDone. The Pico should now be transmitting.")

@@ -87,10 +87,12 @@ def set_pico_clock(epoch_s):
 
 
 def _handle_serial_command(line):
-    """Parse and execute a line like 'START DCF77 1789673999' or 'STOP'.
-    The epoch second in a START command is captured by pc_sync.py at the
-    moment of the user's Enter keypress, so we start transmitting
-    immediately — no further delay — to keep that moment as second zero."""
+    """Parse and execute a line like 'START DCF77 1789673999' or
+    'START DCF77 1789673999 500000' (with a test frequency offset in Hz)
+    or 'STOP'. The epoch second in a START command is captured by
+    pc_sync.py at the moment of the user's Enter keypress, so we start
+    transmitting immediately — no further delay — to keep that moment as
+    second zero."""
     parts = line.strip().split()
     if not parts:
         return "ERR empty command"
@@ -100,18 +102,27 @@ def _handle_serial_command(line):
         transmitter.stop()
         return "OK stopped"
 
-    if cmd == "START" and len(parts) == 3:
+    if cmd == "START" and len(parts) in (3, 4):
         protocol = parts[1].upper()
         try:
             epoch_s = int(parts[2])
         except ValueError:
             return "ERR bad epoch value"
+        freq_offset_hz = 0
+        if len(parts) == 4:
+            try:
+                freq_offset_hz = int(parts[3])
+            except ValueError:
+                return "ERR bad frequency offset value"
         if protocol not in timecode.ENCODERS:
             return "ERR unknown protocol " + protocol
         if transmitter.is_transmitting():
             return "ERR already transmitting — send STOP first"
-        ok = transmitter.start(protocol, epoch_s)
-        return "OK started " + protocol if ok else "ERR could not start"
+        ok = transmitter.start(protocol, epoch_s, freq_offset_hz)
+        if ok:
+            actual_hz = timecode.CARRIER_HZ[protocol] + freq_offset_hz
+            return "OK started " + protocol + " at " + str(actual_hz) + " Hz"
+        return "ERR could not start"
 
     return "ERR unrecognized command: " + line
 
@@ -168,9 +179,17 @@ PROTOCOL_LABELS = {
 
 def build_page(status_msg="", error_msg=""):
     transmitting = transmitter.is_transmitting()
-    state_text = "TRANSMITTING" if transmitting else "STOPPED"
-    state_color = "#22c55e" if transmitting else "#94a3b8"
     current_proto = transmitter.current_protocol() or ""
+    current_hz = transmitter.current_carrier_hz()
+    if transmitting and current_hz is not None:
+        real_hz = timecode.CARRIER_HZ.get(current_proto, current_hz)
+        if current_hz != real_hz:
+            state_text = "TRANSMITTING (TEST: %d Hz, real is %d Hz)" % (current_hz, real_hz)
+        else:
+            state_text = "TRANSMITTING (%d Hz)" % current_hz
+    else:
+        state_text = "STOPPED"
+    state_color = "#22c55e" if transmitting else "#94a3b8"
 
     options_html = ""
     for proto, label in PROTOCOL_LABELS.items():
@@ -276,6 +295,25 @@ def build_page(status_msg="", error_msg=""):
         {options_html}
       </select>
     </div>
+
+    <details>
+      <summary>Frequency test mode (for SDR reception testing)</summary>
+      <div class="section">
+        <label for="freq_offset">Shift carrier up by</label>
+        <select name="freq_offset" id="freq_offset" {start_disabled}>
+          <option value="0" selected>Off — transmit on the real frequency</option>
+          <option value="500000">+500 kHz (e.g. DCF77 → 577.5 kHz, WWVB → 560 kHz)</option>
+          <option value="1000000">+1 MHz</option>
+        </select>
+      </div>
+      <div class="hint">
+        No clock will ever pick this up — it's for checking the actual
+        on/off pulse pattern on an SDR or spectrum display when your
+        receiver can't tune down to the real frequency (many cheap
+        RTL-SDR dongles bottom out around 500 kHz). The bit timing is
+        identical either way; only the carrier frequency moves.
+      </div>
+    </details>
 
     <div class="hint" id="auto-hint">
       This page reads your phone's own clock automatically — no need to
@@ -507,13 +545,15 @@ def run_web_mode():
 
             elif method == "GET" and path == "/status":
                 y, mo, d, hh, mm, ss, wd, _yd = time.gmtime()
+                carrier_hz = transmitter.current_carrier_hz()
                 body_json = (
                     '{"synced": %s, "transmitting": %s, "protocol": "%s", '
-                    '"utc": "%04d-%02d-%02d %02d:%02d:%02d"}'
+                    '"carrier_hz": %s, "utc": "%04d-%02d-%02d %02d:%02d:%02d"}'
                 ) % (
                     "true" if _clock_synced else "false",
                     "true" if transmitter.is_transmitting() else "false",
                     transmitter.current_protocol() or "",
+                    carrier_hz if carrier_hz is not None else "null",
                     y, mo, d, hh, mm, ss,
                 )
                 _send_json(conn, body_json)
@@ -521,6 +561,10 @@ def run_web_mode():
             elif method == "POST" and path == "/start":
                 params = _parse_post_body(body)
                 protocol = params.get("protocol", "").strip().upper()
+                try:
+                    freq_offset_hz = int(params.get("freq_offset", "0").strip() or "0")
+                except ValueError:
+                    freq_offset_hz = 0
 
                 if transmitter.is_transmitting():
                     error_msg = "Already transmitting — stop first."
@@ -538,7 +582,7 @@ def run_web_mode():
                             utc_offset_hours = int(offset_str)
                             target_epoch = _local_date_time_to_epoch(date_str, time_str, utc_offset_hours)
                             set_pico_clock(target_epoch)
-                            ok = transmitter.start(protocol, target_epoch)
+                            ok = transmitter.start(protocol, target_epoch, freq_offset_hz)
                             if ok:
                                 time.sleep(0.1)
                                 _send_redirect(conn)
@@ -556,7 +600,7 @@ def run_web_mode():
                     # Pico's own current, already-accurate clock. No manual
                     # date/time entry or tick-watching needed at all.
                     target_epoch = time.time()
-                    ok = transmitter.start(protocol, target_epoch)
+                    ok = transmitter.start(protocol, target_epoch, freq_offset_hz)
                     if ok:
                         time.sleep(0.1)
                         _send_redirect(conn)

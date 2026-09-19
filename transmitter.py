@@ -34,6 +34,7 @@ _carrier_hz = 60000
 _playing = False
 _stop_flag = False
 _current_protocol = None
+_current_carrier_hz = None
 _lock = _thread.allocate_lock()
 
 
@@ -151,6 +152,13 @@ def current_protocol():
     return _current_protocol
 
 
+def current_carrier_hz():
+    """The actual carrier frequency in use right now, including any test
+    offset applied via start()'s freq_offset_hz — None if not
+    transmitting."""
+    return _current_carrier_hz
+
+
 def stop():
     """Signal the transmit thread to stop. Returns immediately; the
     thread finishes its current second and masks the carrier."""
@@ -158,7 +166,7 @@ def stop():
     _stop_flag = True
 
 
-def _transmit_thread(protocol, start_epoch_s, anchor_ticks_us, anchor_epoch_s):
+def _transmit_thread(protocol, start_epoch_s, anchor_ticks_us, anchor_epoch_s, freq_offset_hz):
     """Runs on the second core. Transmits `protocol` continuously,
     starting so that the frame beginning at `start_epoch_s` (a UTC epoch
     second) is played out exactly on time. anchor_ticks_us/anchor_epoch_s
@@ -166,13 +174,23 @@ def _transmit_thread(protocol, start_epoch_s, anchor_ticks_us, anchor_epoch_s):
     caller as close as possible to the actual "tick" moment (a keypress
     or a web request's arrival) — capturing them in start(), before the
     new thread even begins, keeps that anchor as tight as possible rather
-    than drifting by however long thread scheduling happens to take."""
-    global _playing, _stop_flag, _current_protocol
+    than drifting by however long thread scheduling happens to take.
+
+    freq_offset_hz shifts the carrier up (or down) from the protocol's
+    real broadcast frequency — e.g. +500000 turns DCF77's 77.5 kHz into
+    577.5 kHz — without changing anything about the bit timing itself.
+    This is a test/reception aid: cheap RTL-SDR dongles typically can't
+    tune below ~500 kHz, so shifting the whole signal up into range lets
+    you verify the actual on/off pulse pattern on a spectrum display or
+    in software, even though no real clock would be listening up there.
+    Pass 0 for normal, on-frequency transmission."""
+    global _playing, _stop_flag, _current_protocol, _current_carrier_hz
     _playing = True
     _stop_flag = False
     _current_protocol = protocol
     try:
-        carrier_hz = timecode.CARRIER_HZ[protocol]
+        carrier_hz = timecode.CARRIER_HZ[protocol] + freq_offset_hz
+        _current_carrier_hz = carrier_hz
         _carrier_init(carrier_hz)
 
         offset_us = (start_epoch_s - anchor_epoch_s) * 1_000_000
@@ -195,11 +213,16 @@ def _transmit_thread(protocol, start_epoch_s, anchor_ticks_us, anchor_epoch_s):
         _playing = False
         _stop_flag = False
         _current_protocol = None
+        _current_carrier_hz = None
 
 
-def start(protocol, start_epoch_s):
+def start(protocol, start_epoch_s, freq_offset_hz=0):
     """Start transmitting `protocol` on the second core, beginning at
     `start_epoch_s` (UTC epoch seconds). No-op if already transmitting.
+
+    freq_offset_hz (default 0, meaning transmit on the real frequency)
+    shifts the carrier for reception testing — see _transmit_thread's
+    docstring for why you'd want this.
 
     Captures the (monotonic tick, wall clock) anchor pair right here,
     synchronously, before handing off to the transmit thread — call this
@@ -214,6 +237,7 @@ def start(protocol, start_epoch_s):
     anchor_ticks_us = utime.ticks_us()
     anchor_epoch_s = utime.time()
     _thread.start_new_thread(
-        _transmit_thread, (protocol, start_epoch_s, anchor_ticks_us, anchor_epoch_s)
+        _transmit_thread,
+        (protocol, start_epoch_s, anchor_ticks_us, anchor_epoch_s, freq_offset_hz),
     )
     return True
