@@ -2,7 +2,8 @@
 #
 # Fill in WIFI_SSID to boot into NTP mode: the Pico joins your network,
 # gets the time over NTP, and transmits automatically (no phone or PC).
-# Leave WIFI_SSID empty to use the original serial / access-point modes.
+# Leave WIFI_SSID empty to fall back to access-point mode (set the time
+# from your phone at http://192.168.4.1 after joining "LongwavePico").
 
 WIFI_SSID = ""
 WIFI_PASSWORD = ""

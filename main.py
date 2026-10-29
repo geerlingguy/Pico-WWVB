@@ -1,47 +1,22 @@
 """
 main.py — Longwave Pico transmitter, boot entry point.
 
-Two ways to set the start time, matching how you'll actually use this:
+Two modes:
 
-  1. PC-connected: run pc_sync.py on a computer plugged into the Pico's
-     USB port. It sends a single line over serial the instant you press
-     Enter — "START <PROTOCOL> <epoch_seconds>" — and this file starts
-     transmitting immediately upon receiving it, so the Enter keypress
-     (timed against your PC's clock, or against you watching a separate
-     accurate clock and hitting Enter on the tick) becomes second zero
-     of the transmission.
+  1. NTP (default): set WIFI_SSID/WIFI_PASSWORD in config.py. The Pico
+     joins your network, syncs over NTP, transmits PROTOCOL automatically
+     (24/7 or during TX_HOURS_UTC), and re-syncs hourly to correct
+     crystal drift.
 
-  2. Standalone (no PC): this file opens a Wi-Fi access point named
-     "LongwavePico" and serves a small web page. Type in the protocol
-     and the target date/time (seconds are always :00), then watch a
-     clock and tap "GO" the instant its second hand reaches 12 for that
-     minute — the moment the Pico receives that request becomes second
-     zero, the same way the PC keypress does in option 1.
-
-  3. NTP (no PC, no phone): set WIFI_SSID/WIFI_PASSWORD in config.py.
-     The Pico joins your network, syncs over NTP, transmits PROTOCOL
-     automatically (24/7 or during TX_HOURS_UTC), and re-syncs hourly to
-     correct crystal drift. This takes priority over modes 1 and 2.
-
-Otherwise, which mode this boots into is controlled by a flag file rather than a
-timed race, since a fixed "wait a few seconds for serial, then give up"
-window is fragile in practice — typing in a date/time by hand in
-pc_sync.py can easily take longer than any short window, which would
-wrongly kick the Pico into Wi-Fi mode mid-setup. Instead:
-
-  - By default (no flag file present), this boots into serial mode and
-    waits indefinitely for pc_sync.py.
-  - To use standalone Wi-Fi mode instead, create an empty file named
-    "wifi_mode.txt" on the Pico's filesystem once (e.g. via Thonny) —
-    from then on it always boots straight into Wi-Fi mode. Delete the
-    file to go back to serial mode.
+  2. Access point (fallback when WIFI_SSID is empty): the Pico opens a
+     Wi-Fi network named "LongwavePico" and serves a web page at
+     http://192.168.4.1 that sets the Pico's clock from your phone's
+     clock and starts/stops transmission.
 """
 
-import sys
 import time
 import network
 import socket
-import os
 import machine
 
 import timecode
@@ -51,8 +26,6 @@ AP_SSID = "LongwavePico"
 AP_PASSWORD = ""  # open network — this is a local utility, not a security boundary
 AP_IP = "192.168.4.1"
 
-WIFI_MODE_FLAG_FILE = "wifi_mode.txt"
-
 # Tracks whether the Pico's clock has been set from a real source (a
 # connecting phone's auto-sync, or a manual entry) since the last power
 # cycle. The RP2040/RP2350 has no battery-backed RTC, so this always
@@ -61,20 +34,12 @@ _clock_synced = False
 _last_sync_epoch = None  # Pico's own utime.time() reading at last sync
 
 
-def _wifi_mode_requested():
-    try:
-        os.stat(WIFI_MODE_FLAG_FILE)
-        return True
-    except OSError:
-        return False
-
-
 def set_pico_clock(epoch_s):
     """Set the Pico's hardware RTC to the given UTC epoch second (Unix
     epoch — confirmed the rp2 MicroPython port uses 1970, same as the
     epoch timecode.py already assumes throughout, so no conversion is
     needed here). Once set, utime.time() keeps advancing on its own from
-    this point, independent of Wi-Fi/serial staying connected."""
+    this point, independent of Wi-Fi staying connected."""
     global _clock_synced, _last_sync_epoch
     y, mo, d, hh, mm, ss, wd, _yday = time.gmtime(epoch_s)
     # machine.RTC().datetime() tuple order: (year, month, day, weekday,
@@ -84,77 +49,6 @@ def set_pico_clock(epoch_s):
     machine.RTC().datetime((y, mo, d, rtc_weekday, hh, mm, ss, 0))
     _clock_synced = True
     _last_sync_epoch = time.time()
-
-
-# ---------------------------------------------------------------------------
-# Serial command listener (for pc_sync.py)
-# ---------------------------------------------------------------------------
-
-
-def _handle_serial_command(line):
-    """Parse and execute a line like 'START DCF77 1789673999' or
-    'START DCF77 1789673999 500000' (with a test frequency offset in Hz)
-    or 'STOP'. The epoch second in a START command is captured by
-    pc_sync.py at the moment of the user's Enter keypress, so we start
-    transmitting immediately — no further delay — to keep that moment as
-    second zero."""
-    parts = line.strip().split()
-    if not parts:
-        return "ERR empty command"
-    cmd = parts[0].upper()
-
-    if cmd == "STOP":
-        transmitter.stop()
-        return "OK stopped"
-
-    if cmd == "START" and len(parts) in (3, 4):
-        protocol = parts[1].upper()
-        try:
-            epoch_s = int(parts[2])
-        except ValueError:
-            return "ERR bad epoch value"
-        freq_offset_hz = 0
-        if len(parts) == 4:
-            try:
-                freq_offset_hz = int(parts[3])
-            except ValueError:
-                return "ERR bad frequency offset value"
-        if protocol not in timecode.ENCODERS:
-            return "ERR unknown protocol " + protocol
-        if transmitter.is_transmitting():
-            return "ERR already transmitting — send STOP first"
-        ok = transmitter.start(protocol, epoch_s, freq_offset_hz)
-        if ok:
-            actual_hz = timecode.CARRIER_HZ[protocol] + freq_offset_hz
-            return "OK started " + protocol + " at " + str(actual_hz) + " Hz"
-        return "ERR could not start"
-
-    return "ERR unrecognized command: " + line
-
-
-def run_serial_mode():
-    """Serial command loop: listens indefinitely for START/STOP lines
-    from pc_sync.py. This is the default boot mode."""
-    print("Longwave Pico — serial command mode.")
-    print("Waiting for commands from pc_sync.py (START <PROTOCOL> <epoch>, STOP)...")
-    try:
-        import uselect as select
-    except ImportError:
-        import select
-    poller = select.poll()
-    poller.register(sys.stdin, select.POLLIN)
-    line = ""
-    while True:
-        events = poller.poll(100)
-        if events:
-            ch = sys.stdin.read(1)
-            if ch in ("\n", "\r"):
-                if line:
-                    resp = _handle_serial_command(line)
-                    print(resp)
-                    line = ""
-            else:
-                line += ch
 
 
 # ---------------------------------------------------------------------------
@@ -830,12 +724,7 @@ if __name__ == "__main__":
     _cfg = _load_config()
     if _cfg:
         run_ntp_mode(_cfg)
-    elif _wifi_mode_requested():
-        print("wifi_mode.txt found — starting standalone Wi-Fi mode.")
-        run_web_mode()
     else:
-        print("Serial mode (default). Run pc_sync.py on a connected PC.")
-        print("(To use standalone Wi-Fi mode instead, create an empty file")
-        print(" named 'wifi_mode.txt' on this Pico's filesystem and reboot.)")
-        run_serial_mode()
+        print("WIFI_SSID not set in config.py — starting access-point mode.")
+        run_web_mode()
 
