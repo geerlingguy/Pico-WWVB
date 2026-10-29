@@ -1,15 +1,9 @@
 """
-ntp.py — minimal SNTP client that keeps sub-second precision.
+ntp.py — minimal SNTP client with sub-second precision.
 
-MicroPython's built-in ntptime only sets the RTC to whole seconds, which
-isn't good enough to line up the start of each transmitted second. This
-returns a (ticks_us, epoch_us) pair instead: "at this ticks_us() reading,
-the UTC time was epoch_us microseconds since 1970".
-
-Note: on the rp2 port ticks_us() wraps every ~17.9 minutes, so a pair is
-only good for converting times within a few minutes of when it was taken.
-Callers should use it right away (to start or correct the transmitter)
-rather than keep it around.
+Returns an anchor (ticks_us, epoch_us, rtt_us): at that ticks_us() reading,
+UTC was epoch_us microseconds since 1970. ticks_us() wraps every ~18 min,
+so use an anchor right away rather than keeping it.
 """
 
 import socket
@@ -19,64 +13,51 @@ import utime
 NTP_TO_UNIX_S = 2208988800
 
 
-def _ts_us(data, offset):
+def _timestamp_us(data, offset):
     secs, frac = struct.unpack("!II", data[offset:offset + 8])
     return (secs - NTP_TO_UNIX_S) * 1_000_000 + ((frac * 1_000_000) >> 32)
 
 
-def query_once(addr, timeout_s=2):
-    """One SNTP exchange. Returns (ticks_us_at_receive, epoch_us, rtt_us)."""
+def _query_once(addr):
     pkt = bytearray(48)
-    pkt[0] = 0x23  # LI=0, VN=4, Mode=3 (client)
+    pkt[0] = 0x23  # version 4, client mode
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    s.settimeout(timeout_s)
+    s.settimeout(2)
     try:
-        t_send = utime.ticks_us()
+        sent = utime.ticks_us()
         s.sendto(pkt, addr)
         data = s.recv(48)
-        t_recv = utime.ticks_us()
+        received = utime.ticks_us()
     finally:
         s.close()
-    if len(data) < 48:
-        raise OSError("short NTP reply")
-    mode = data[0] & 0x07
-    stratum = data[1]
-    if mode != 4 or stratum == 0 or stratum > 15:
-        raise OSError("bad NTP reply (mode %d, stratum %d)" % (mode, stratum))
-    t2 = _ts_us(data, 32)  # server receive time
-    t3 = _ts_us(data, 40)  # server transmit time
-    rtt = utime.ticks_diff(t_recv, t_send) - (t3 - t2)
-    if rtt < 0:
-        rtt = 0
-    return t_recv, t3 + rtt // 2, rtt
+    if len(data) < 48 or data[0] & 7 != 4 or not 0 < data[1] < 16:
+        raise OSError("bad NTP reply")
+    server_rx, server_tx = _timestamp_us(data, 32), _timestamp_us(data, 40)
+    rtt = max(0, utime.ticks_diff(received, sent) - (server_tx - server_rx))
+    return received, server_tx + rtt // 2, rtt
 
 
-def query(host, samples=4, port=123):
-    """Take several samples and keep the one with the lowest round trip
-    (least network asymmetry). Returns (ticks_us, epoch_us, rtt_us)."""
-    addr = socket.getaddrinfo(host, port)[0][-1]
-    best = None
-    last_err = None
-    for _ in range(samples):
+def query(host):
+    """Best of 4 samples (lowest round trip = least asymmetry)."""
+    addr = socket.getaddrinfo(host, 123)[0][-1]
+    best, err = None, None
+    for _ in range(4):
         try:
-            r = query_once(addr)
+            r = _query_once(addr)
             if best is None or r[2] < best[2]:
                 best = r
         except OSError as e:
-            last_err = e
-        utime.sleep_ms(50)
+            err = e
     if best is None:
-        raise last_err or OSError("NTP failed")
+        raise err
     return best
 
 
-def ticks_for_epoch_us(anchor, epoch_us):
-    """ticks_us() value corresponding to epoch_us, given an anchor from
-    query(). Only valid for times within a few minutes of the anchor."""
-    a_ticks, a_epoch_us, _ = anchor
-    return utime.ticks_add(a_ticks, epoch_us - a_epoch_us)
+def ticks_at(anchor, epoch_us):
+    """ticks_us() value at UTC epoch_us (within a few minutes of anchor)."""
+    return utime.ticks_add(anchor[0], epoch_us - anchor[1])
 
 
-def epoch_us_now(anchor):
-    a_ticks, a_epoch_us, _ = anchor
-    return a_epoch_us + utime.ticks_diff(utime.ticks_us(), a_ticks)
+def now_us(anchor):
+    """Current UTC epoch in microseconds."""
+    return anchor[1] + utime.ticks_diff(utime.ticks_us(), anchor[0])
