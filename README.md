@@ -18,7 +18,9 @@ DCF77, MSF, JJY, and BPC are also supported.
 
 **GP0 (pin 1) → 220 Ω → loop antenna → GP1 (pin 2)**
 
-Wind the wire into 20–30 turns about 2–3 cm across (around a bottle cap or marker), leaving two leads. GP0 and GP1 drive the loop in opposite directions, giving it twice the voltage swing of a single pin.
+<sub>Pico 2 W illustration from [Pinout.xyz](https://github.com/pinout-xyz/Pinout.xyz), licensed [CC BY-SA 4.0](https://github.com/pinout-xyz/Pinout.xyz?tab=CC-BY-SA-4.0-1-ov-file); `wiring.svg` is shared under the same license.</sub>
+
+Wind one continuous piece of wire into 20–30 turns about 2–3 cm across (around a bottle cap or marker), leaving a lead at each end. One end goes to the resistor, the other to GP1. GP0 and GP1 drive the loop in opposite directions, giving it twice the voltage swing of a single pin.
 
 - Don't skip the resistor. At 60 kHz a small air coil is nearly a short circuit.
 - The loop must be closed (both ends connected). A wire with a free end barely radiates the magnetic field the clock listens for.
