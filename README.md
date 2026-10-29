@@ -25,7 +25,10 @@ Wind the wire into a loop of 20–30 turns, 2–3 cm across (a bottle cap makes 
 
 ## Setup
 
-1. Flash MicroPython for the [Pico 2 W](https://micropython.org/download/RPI_PICO2_W/) or [Pico W](https://micropython.org/download/RPI_PICO_W/).
+First, make sure you have [`mpremote`]() installed on your computer. Then:
+
+1. Plug your Pico into your computer while holding down the 'BOOT' button. This will mount it as `RPI-RP2`.
+1. Flash MicroPython for the [Pico 2 W](https://micropython.org/download/RPI_PICO2_W/) or [Pico W](https://micropython.org/download/RPI_PICO_W/) by copying the respective `UF2` file to the `RPI-RP2` mount. After the copy is finished, it will unmount and is ready for your code.
 2. Put your Wi-Fi name and password in `config.py`. Optionally, change `NTP_SERVER` to a server on your network.
 3. Copy the files over and reset the Pico:
 
