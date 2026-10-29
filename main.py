@@ -18,7 +18,12 @@ Two ways to set the start time, matching how you'll actually use this:
      minute — the moment the Pico receives that request becomes second
      zero, the same way the PC keypress does in option 1.
 
-Which mode this boots into is controlled by a flag file rather than a
+  3. NTP (no PC, no phone): set WIFI_SSID/WIFI_PASSWORD in config.py.
+     The Pico joins your network, syncs over NTP, transmits PROTOCOL
+     automatically (24/7 or during TX_HOURS_UTC), and re-syncs hourly to
+     correct crystal drift. This takes priority over modes 1 and 2.
+
+Otherwise, which mode this boots into is controlled by a flag file rather than a
 timed race, since a fixed "wait a few seconds for serial, then give up"
 window is fragile in practice — typing in a date/time by hand in
 pc_sync.py can easily take longer than any short window, which would
@@ -626,12 +631,206 @@ def run_web_mode():
 
 
 # ---------------------------------------------------------------------------
+# NTP mode (config.py with WIFI_SSID set): join Wi-Fi, sync, transmit
+# ---------------------------------------------------------------------------
+
+ANCHOR_MAX_AGE_MS = 300_000   # ticks_us wraps every ~17.9 min on rp2
+SYNC_RETRY_MS = 30_000
+
+_ntp_status = {
+    "ntp_server": None, "last_sync_utc": None, "rtt_ms": None,
+    "last_correction_ms": None, "syncs": 0, "errors": 0, "last_error": "",
+    "ip": None,
+}
+
+
+def _load_config():
+    try:
+        import config
+    except ImportError:
+        return None
+    return config if getattr(config, "WIFI_SSID", "") else None
+
+
+def _wifi_connect(cfg, timeout_s=30):
+    wlan = network.WLAN(network.STA_IF)
+    if wlan.isconnected():
+        return wlan
+    try:
+        import rp2
+        rp2.country(getattr(cfg, "WIFI_COUNTRY", "US"))
+    except Exception:
+        pass
+    try:
+        network.hostname(getattr(cfg, "HOSTNAME", "longwave-pico"))
+    except Exception:
+        pass
+    wlan.active(True)
+    try:
+        wlan.config(pm=network.WLAN.PM_NONE)  # steadier NTP round trips
+    except Exception:
+        pass
+    print("Connecting to Wi-Fi", cfg.WIFI_SSID, "...")
+    wlan.connect(cfg.WIFI_SSID, cfg.WIFI_PASSWORD)
+    t0 = time.ticks_ms()
+    while not wlan.isconnected():
+        if time.ticks_diff(time.ticks_ms(), t0) > timeout_s * 1000:
+            wlan.disconnect()
+            raise OSError("Wi-Fi connect timed out (status %d)" % wlan.status())
+        time.sleep_ms(200)
+    _ntp_status["ip"] = wlan.ifconfig()[0]
+    print("Wi-Fi connected:", _ntp_status["ip"])
+    return wlan
+
+
+def _ntp_sync(cfg):
+    """Returns a fresh (ticks_us, epoch_us, rtt_us) anchor, or None."""
+    import ntp
+    server = getattr(cfg, "NTP_SERVER", "pool.ntp.org")
+    _ntp_status["ntp_server"] = server
+    try:
+        _wifi_connect(cfg)
+        anchor = ntp.query(server)
+    except Exception as e:
+        _ntp_status["errors"] += 1
+        _ntp_status["last_error"] = str(e)
+        print("NTP sync failed:", e)
+        return None
+    set_pico_clock(ntp.epoch_us_now(anchor) // 1_000_000)
+    _ntp_status["syncs"] += 1
+    _ntp_status["rtt_ms"] = anchor[2] / 1000
+    y, mo, d, hh, mm, ss = time.gmtime()[:6]
+    _ntp_status["last_sync_utc"] = "%04d-%02d-%02d %02d:%02d:%02d" % (y, mo, d, hh, mm, ss)
+    print("NTP sync OK:", _ntp_status["last_sync_utc"], "UTC, rtt %.1f ms" % _ntp_status["rtt_ms"])
+    return anchor
+
+
+def _start_tx(cfg, anchor):
+    import ntp
+    protocol = cfg.PROTOCOL.upper()
+    # First frame boundary at least 200 ms out, to leave time for PIO setup.
+    s = -(-(ntp.epoch_us_now(anchor) + 200_000) // 1_000_000)
+    frame_epoch = transmitter.next_frame_boundary(protocol, s)
+    frame_ticks = ntp.ticks_for_epoch_us(anchor, frame_epoch * 1_000_000)
+    if transmitter.start_at(protocol, frame_epoch, frame_ticks):
+        print("Transmitting %s from %s UTC on GPIO %s" % (
+            protocol, "%02d:%02d:%02d" % time.gmtime(frame_epoch)[3:6], transmitter.TX_PINS))
+
+
+def _correct_drift(cfg, anchor):
+    """Compare when the transmitter *thinks* the current frame started with
+    when NTP says it did, and nudge the following frames to match."""
+    import ntp
+    pos = transmitter.position()
+    if pos is None:
+        return
+    frame_epoch, frame_ticks = pos
+    true_ticks = ntp.ticks_for_epoch_us(anchor, frame_epoch * 1_000_000)
+    delta_us = time.ticks_diff(true_ticks, frame_ticks)
+    _ntp_status["last_correction_ms"] = delta_us / 1000
+    print("Drift correction: %+.1f ms" % (delta_us / 1000))
+    if abs(delta_us) > 2_000_000:
+        print("Large offset — restarting transmission")
+        transmitter.stop(wait_ms=3000)
+        _start_tx(cfg, anchor)
+    else:
+        transmitter.adjust(delta_us)
+
+
+def _in_tx_window(cfg):
+    hours = getattr(cfg, "TX_HOURS_UTC", None)
+    return (not hours) or (time.gmtime()[3] in hours)
+
+
+def _status_json(cfg):
+    import json
+    d = dict(_ntp_status)
+    d["utc"] = "%04d-%02d-%02d %02d:%02d:%02d" % time.gmtime()[:6]
+    d["protocol"] = cfg.PROTOCOL.upper()
+    d["transmitting"] = transmitter.is_transmitting()
+    d["carrier_hz"] = transmitter.current_carrier_hz()
+    d["tx_pins"] = list(transmitter.TX_PINS)
+    d["tx_hours_utc"] = list(getattr(cfg, "TX_HOURS_UTC", None) or [])
+    return json.dumps(d)
+
+
+def _serve_status_once(srv, cfg):
+    try:
+        conn, _addr = srv.accept()
+    except OSError:
+        return  # timeout: doubles as the main loop's sleep
+    try:
+        conn.settimeout(2)
+        conn.recv(512)
+        _send_json(conn, _status_json(cfg))
+    except Exception as e:
+        print("Status request error:", e)
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def run_ntp_mode(cfg):
+    print("NTP mode: %s via %s" % (cfg.PROTOCOL, getattr(cfg, "NTP_SERVER", "pool.ntp.org")))
+    resync_ms = int(getattr(cfg, "NTP_RESYNC_S", 3600)) * 1000
+    anchor = None
+    anchor_ms = 0
+    last_try_ms = None
+    srv = None
+
+    while True:
+        now = time.ticks_ms()
+        age = time.ticks_diff(now, anchor_ms) if anchor else None
+        idle = _clock_synced and _in_tx_window(cfg) and not transmitter.is_transmitting()
+        need_sync = (anchor is None or age >= resync_ms
+                     or (idle and age > ANCHOR_MAX_AGE_MS))
+        if need_sync and (last_try_ms is None
+                          or time.ticks_diff(now, last_try_ms) >= SYNC_RETRY_MS):
+            last_try_ms = now
+            fresh = _ntp_sync(cfg)
+            if fresh:
+                anchor, anchor_ms = fresh, time.ticks_ms()
+                if transmitter.is_transmitting():
+                    _correct_drift(cfg, anchor)
+
+        want_tx = _clock_synced and _in_tx_window(cfg)
+        if want_tx and not transmitter.is_transmitting():
+            if anchor and time.ticks_diff(time.ticks_ms(), anchor_ms) <= ANCHOR_MAX_AGE_MS:
+                _start_tx(cfg, anchor)
+        elif not want_tx and transmitter.is_transmitting():
+            print("Outside TX_HOURS_UTC — stopping")
+            transmitter.stop(wait_ms=2000)
+
+        if srv is None and getattr(cfg, "STATUS_SERVER", True) and _ntp_status["ip"]:
+            try:
+                srv = socket.socket()
+                srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                srv.bind(socket.getaddrinfo("0.0.0.0", 80)[0][-1])
+                srv.listen(2)
+                srv.settimeout(0.5)
+                print("Status: http://%s/ (or http://%s.local/)" % (
+                    _ntp_status["ip"], getattr(cfg, "HOSTNAME", "longwave-pico")))
+            except Exception as e:
+                print("Status server unavailable:", e)
+                srv = False
+        if srv:
+            _serve_status_once(srv, cfg)
+        else:
+            time.sleep_ms(500)
+
+
+# ---------------------------------------------------------------------------
 # Boot
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
     print("Longwave Pico booting...")
-    if _wifi_mode_requested():
+    _cfg = _load_config()
+    if _cfg:
+        run_ntp_mode(_cfg)
+    elif _wifi_mode_requested():
         print("wifi_mode.txt found — starting standalone Wi-Fi mode.")
         run_web_mode()
     else:

@@ -126,6 +126,25 @@ def uk_local_parts(epoch_s):
     return y, m, d, hh, mm, ss, wd, is_dst
 
 
+def _nth_sunday_days(year, month, n):
+    """Days-since-epoch of the nth Sunday (1-based) of month."""
+    first = _days_from_civil(year, month, 1)
+    wd = _weekday_from_days(first)  # 0=Sunday
+    return first + (7 - wd) % 7 + 7 * (n - 1)
+
+
+def us_dst_at_utc_midnight(utc_day):
+    """True if US DST is in effect at 00:00 UTC on the given day (days since
+    1970-01-01). Current US rule: DST starts the 2nd Sunday of March and
+    ends the 1st Sunday of November. 00:00 UTC is still the previous
+    evening in every US zone, so DST is 'in effect' at 00:00 UTC from the
+    day after the start Sunday through the end Sunday itself."""
+    y = _civil_from_days(utc_day)[0]
+    start = _nth_sunday_days(y, 3, 2)
+    end = _nth_sunday_days(y, 11, 1)
+    return start < utc_day <= end
+
+
 def fixed_offset_local_parts(epoch_s, offset_hours):
     """No-DST fixed offset (JST = +9, CST-China = +8)."""
     y, m, d, hh, mm, ss, wd = utc_parts_from_epoch(epoch_s + offset_hours * 3600)
@@ -323,6 +342,8 @@ def encode_wwvb(epoch_s):
 
     doy_bits = _bits_for_weights(doy, [200, 100, 0, 80, 40, 20, 10, 0, 8, 4, 2, 1])
     for i in range(12):
+        if 22 + i == 29:
+            continue  # :29 is position marker P3, not a day-of-year bit
         code[22 + i] = doy_bits[i]
 
     yy = y % 100
@@ -335,8 +356,12 @@ def encode_wwvb(epoch_s):
 
     code[55] = leap
     code[56] = 0
-    code[57] = 0
-    code[58] = 0
+    # DST status (NIST SP 432): bit 57 = DST in effect at 24:00 UTC (end of
+    # this UTC day), bit 58 = DST in effect at 00:00 UTC (start of it).
+    # 00 = standard, 10 = DST begins today, 11 = DST, 01 = DST ends today.
+    utc_day = int(epoch_s) // 86400
+    code[57] = 1 if us_dst_at_utc_midnight(utc_day + 1) else 0
+    code[58] = 1 if us_dst_at_utc_midnight(utc_day) else 0
 
     pulses = []
     for sym in code:

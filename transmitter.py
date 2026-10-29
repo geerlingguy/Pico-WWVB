@@ -1,23 +1,23 @@
 """
-transmitter.py — drives a GPIO pin as a low-frequency OOK (on/off keyed)
+transmitter.py — drives GPIO pin(s) as a low-frequency OOK (on/off keyed)
 carrier for DCF77, MSF, WWVB, JJY, or BPC, gated by timecode.py's
 per-second pulse frames.
 
-Adapted directly from this project family's existing Pico AM-radio
-transmitter (pico_am_radio.py / Web-iinteractive/radio.py): a PIO state
-machine free-runs a square wave on the output pin, and "gating" means
-handing the pin between PIO control (carrier visible) and plain GPIO-low
-control (carrier masked) — exactly the same technique, just retuned to
-much lower carrier frequencies (40-77.5 kHz instead of ~1 MHz) and much
-slower symbol timing (whole seconds instead of audio-rate note toggling).
+A PIO state machine free-runs a square wave on the output pin(s), and
+"gating" means handing the pin(s) between PIO control (carrier on) and
+plain GPIO-low control (carrier off).
 
-Antenna note: solder ~20-30cm of wire to the chosen GPIO pin (GP0 by
-default, following the AM-radio repo's reasoning: it's the top-left
-corner pin, so a stray touch only risks a harmless neighboring GPIO
-rather than a power/ground rail). Coiling the wire into a small loop
-(a few turns around a pen or similar) concentrates the near-field
-magnetic coupling these clocks' ferrite-rod antennas pick up, and tends
-to work better than a straight wire at these frequencies.
+Antenna: the field a radio clock's ferrite rod picks up is magnetic, so
+the coil needs current flowing through it — i.e. a closed loop, not a
+wire with a free end.
+
+  Differential (default, TX_PINS = (0, 1)): GP0 -> 220R -> coil -> GP1.
+    The two pins toggle in antiphase, so the coil sees a 6.6 V swing
+    instead of 3.3 V (about twice the current, twice the field).
+  Single-ended (TX_PINS = (0,)): GP0 -> 220R -> coil -> GND.
+
+Never connect a coil without the series resistor: a small air coil is
+close to a dead short at 60 kHz.
 """
 
 import rp2
@@ -27,52 +27,72 @@ import _thread
 
 import timecode
 
-TONE_GPIO = 0  # GP0 (physical pin 1) — see antenna note above
+try:
+    import config as _cfg
+    TX_PINS = tuple(getattr(_cfg, "TX_PINS", (0,)))
+except ImportError:
+    TX_PINS = (0,)  # original single-pin GP0 behavior
+
+_ALT_PIO0 = getattr(machine.Pin, "ALT_PIO0", 6)
 
 _sm = None
-_carrier_hz = 60000
 _playing = False
 _stop_flag = False
 _current_protocol = None
 _current_carrier_hz = None
-_lock = _thread.allocate_lock()
+_position = None        # (frame_epoch_s, frame_start_ticks_us) of current frame
+_pending_adjust_us = 0  # applied at the next frame boundary
 
 
 @rp2.asm_pio(set_init=rp2.PIO.OUT_LOW)
-def _squarewave():
+def _squarewave_1pin():
     wrap_target()
     set(pins, 1)
     set(pins, 0)
     wrap()
 
 
+@rp2.asm_pio(set_init=(rp2.PIO.OUT_LOW, rp2.PIO.OUT_LOW))
+def _squarewave_2pin():
+    wrap_target()
+    set(pins, 0b01)  # pin A high, pin B low
+    set(pins, 0b10)  # pin A low, pin B high
+    wrap()
+
+
+def _pins_low():
+    for p in TX_PINS:
+        machine.Pin(p, machine.Pin.OUT, value=0)
+
+
 def _carrier_init(carrier_hz):
     """(Re)start the PIO state machine at the given carrier frequency."""
-    global _sm, _carrier_hz
+    global _sm
+    if len(TX_PINS) == 2 and TX_PINS[1] != TX_PINS[0] + 1:
+        raise ValueError("TX_PINS must be two consecutive GPIOs, e.g. (0, 1)")
     if _sm is not None:
         _sm.active(0)
-    _carrier_hz = carrier_hz
-    sys_clk = machine.freq()
-    target_pio_hz = 2 * carrier_hz  # 2-instruction toggle loop
-    target_pio_hz = min(target_pio_hz, sys_clk)
-    _sm = rp2.StateMachine(
-        0,
-        _squarewave,
-        freq=target_pio_hz,
-        set_base=machine.Pin(TONE_GPIO),
-    )
+    for p in TX_PINS:
+        try:
+            machine.Pin(p, machine.Pin.OUT, value=0, drive=machine.Pin.DRIVE_3)  # 12 mA
+        except (AttributeError, TypeError, ValueError):
+            machine.Pin(p, machine.Pin.OUT, value=0)
+    prog = _squarewave_2pin if len(TX_PINS) == 2 else _squarewave_1pin
+    # 2-instruction loop → carrier = PIO clock / 2. On a Pico 2 W at the
+    # default 150 MHz, 120 kHz divides exactly (1250), so WWVB is 60.000 kHz.
+    _sm = rp2.StateMachine(0, prog, freq=2 * carrier_hz,
+                           set_base=machine.Pin(TX_PINS[0]))
     _sm.active(1)
-    machine.Pin(TONE_GPIO, machine.Pin.OUT, value=0)  # start masked (carrier off)
+    _pins_low()  # start masked (carrier off)
 
 
 def _gate_on():
-    """Hand the pin to PIO so the carrier is visible (ASK 'high')."""
-    machine.Pin(TONE_GPIO).init(machine.Pin.ALT, alt=6)  # ALT6 = PIO0
+    for p in TX_PINS:
+        machine.Pin(p).init(machine.Pin.ALT, alt=_ALT_PIO0)
 
 
 def _gate_off():
-    """Drive the pin low via plain GPIO, masking the carrier (ASK 'low')."""
-    machine.Pin(TONE_GPIO, machine.Pin.OUT, value=0)
+    _pins_low()
 
 
 def _teardown():
@@ -85,31 +105,29 @@ def _teardown():
 
 # ---------------------------------------------------------------------------
 # Pulse playback — walks one second's pulse descriptor from timecode.py,
-# holding the carrier at the right level for the right number of
-# milliseconds, checked against a monotonic clock so drift doesn't
-# accumulate across a whole frame.
+# holding the carrier at the right level until absolute tick deadlines so
+# drift doesn't accumulate across a frame.
 # ---------------------------------------------------------------------------
 
 def _hold_until(deadline_us, level):
-    """Set the carrier to `level` ('high'/'low') and busy-wait/sleep until
-    deadline_us (a utime.ticks_us() value), checking _stop_flag."""
+    """Set the carrier to `level` ('high'/'low') and wait until deadline_us
+    (a utime.ticks_us() value), checking _stop_flag."""
     if level == "high":
         _gate_on()
     else:
         _gate_off()
-    while utime.ticks_diff(deadline_us, utime.ticks_us()) > 0:
+    while True:
+        remaining = utime.ticks_diff(deadline_us, utime.ticks_us())
+        if remaining <= 0:
+            break
         if _stop_flag:
             return False
-        remaining = utime.ticks_diff(deadline_us, utime.ticks_us())
         if remaining > 2000:
             utime.sleep_us(min(remaining - 1000, 5000))
     return not _stop_flag
 
 
 def _play_pulse(pulse, second_start_us):
-    """Play one second's pulse, timed relative to second_start_us (a
-    utime.ticks_us() value marking the start of this second). Returns
-    False if interrupted by _stop_flag."""
     if "pattern" in pulse:
         t = second_start_us
         for ms, level in pulse["pattern"]:
@@ -123,9 +141,7 @@ def _play_pulse(pulse, second_start_us):
         if not _hold_until(t1, pulse["first_level"]):
             return False
         t2 = utime.ticks_add(t1, pulse["second_ms"] * 1000)
-        if not _hold_until(t2, pulse["second_level"]):
-            return False
-        return True
+        return _hold_until(t2, pulse["second_level"])
 
     # default shape: low for low_ms, then high for the rest of the second
     low_ms = pulse.get("low_ms", 0)
@@ -134,8 +150,6 @@ def _play_pulse(pulse, second_start_us):
         t1 = utime.ticks_add(second_start_us, low_ms * 1000)
         if not _hold_until(t1, "low"):
             return False
-    else:
-        _gate_on()  # no low phase at all (e.g. DCF77 minute gap, BPC marker)
     t2 = utime.ticks_add(second_start_us, (low_ms + high_ms) * 1000)
     return _hold_until(t2, "high")
 
@@ -153,91 +167,101 @@ def current_protocol():
 
 
 def current_carrier_hz():
-    """The actual carrier frequency in use right now, including any test
-    offset applied via start()'s freq_offset_hz — None if not
-    transmitting."""
+    """Actual carrier frequency in use (including any test offset), or None."""
     return _current_carrier_hz
 
 
-def stop():
-    """Signal the transmit thread to stop. Returns immediately; the
-    thread finishes its current second and masks the carrier."""
+def position():
+    """(frame_epoch_s, frame_start_ticks_us) for the frame being sent right
+    now, or None. Used by NTP mode to measure and correct drift."""
+    return _position
+
+
+def adjust(delta_us):
+    """Shift all frames from the next frame boundary onward by delta_us
+    (positive = later). Used to keep a long-running transmission locked to
+    NTP as the Pico's crystal drifts."""
+    global _pending_adjust_us
+    _pending_adjust_us = int(delta_us)
+
+
+def stop(wait_ms=0):
+    """Signal the transmit thread to stop. Optionally wait (up to wait_ms)
+    for it to finish masking the carrier."""
     global _stop_flag
+    if not _playing:
+        return
     _stop_flag = True
+    t0 = utime.ticks_ms()
+    while _playing and utime.ticks_diff(utime.ticks_ms(), t0) < wait_ms:
+        utime.sleep_ms(10)
 
 
-def _transmit_thread(protocol, start_epoch_s, anchor_ticks_us, anchor_epoch_s, freq_offset_hz):
-    """Runs on the second core. Transmits `protocol` continuously,
-    starting so that the frame beginning at `start_epoch_s` (a UTC epoch
-    second) is played out exactly on time. anchor_ticks_us/anchor_epoch_s
-    are a matched (monotonic-clock, wall-clock) pair captured by the
-    caller as close as possible to the actual "tick" moment (a keypress
-    or a web request's arrival) — capturing them in start(), before the
-    new thread even begins, keeps that anchor as tight as possible rather
-    than drifting by however long thread scheduling happens to take.
-
-    freq_offset_hz shifts the carrier up (or down) from the protocol's
-    real broadcast frequency — e.g. +500000 turns DCF77's 77.5 kHz into
-    577.5 kHz — without changing anything about the bit timing itself.
-    This is a test/reception aid: cheap RTL-SDR dongles typically can't
-    tune below ~500 kHz, so shifting the whole signal up into range lets
-    you verify the actual on/off pulse pattern on a spectrum display or
-    in software, even though no real clock would be listening up there.
-    Pass 0 for normal, on-frequency transmission."""
+def _transmit_thread(protocol, frame_epoch_s, frame_start_us, freq_offset_hz):
+    """Runs on the second core. frame_epoch_s must be a frame boundary (a
+    multiple of the protocol's frame length) and frame_start_us the
+    ticks_us() value at which that UTC second begins."""
     global _playing, _stop_flag, _current_protocol, _current_carrier_hz
-    _playing = True
-    _stop_flag = False
+    global _position, _pending_adjust_us
     _current_protocol = protocol
     try:
         carrier_hz = timecode.CARRIER_HZ[protocol] + freq_offset_hz
         _current_carrier_hz = carrier_hz
         _carrier_init(carrier_hz)
 
-        offset_us = (start_epoch_s - anchor_epoch_s) * 1_000_000
-        frame_start_us = utime.ticks_add(anchor_ticks_us, offset_us)
+        # Carrier stays masked until the first frame boundary.
+        if not _hold_until(frame_start_us, "low"):
+            return
 
-        current_epoch = start_epoch_s
+        current_epoch = frame_epoch_s
         while not _stop_flag:
-            frame = timecode.encode(protocol, current_epoch)
-            pulses = frame["pulses"]
+            _position = (current_epoch, frame_start_us)
+            pulses = timecode.encode(protocol, current_epoch)["pulses"]
             for i, pulse in enumerate(pulses):
                 second_us = utime.ticks_add(frame_start_us, i * 1_000_000)
                 if not _play_pulse(pulse, second_us):
                     return
-            frame_start_us = utime.ticks_add(frame_start_us, len(pulses) * 1_000_000)
+            adj, _pending_adjust_us = _pending_adjust_us, 0
+            frame_start_us = utime.ticks_add(frame_start_us, len(pulses) * 1_000_000 + adj)
             current_epoch += len(pulses)
     except Exception as e:
         print("Transmit error:", e)
     finally:
         _teardown()
-        _playing = False
-        _stop_flag = False
+        _position = None
         _current_protocol = None
         _current_carrier_hz = None
+        _stop_flag = False
+        _playing = False
+
+
+def next_frame_boundary(protocol, epoch_s):
+    n = timecode.FRAME_LEN_S.get(protocol, 60)
+    return -(-int(epoch_s) // n) * n  # round up to a multiple of n
+
+
+def start_at(protocol, frame_epoch_s, frame_start_ticks_us, freq_offset_hz=0):
+    """Start transmitting with frame `frame_epoch_s` (a frame boundary, UTC
+    epoch seconds) beginning exactly at tick `frame_start_ticks_us`. The
+    caller supplies a precise (tick, time) relationship, e.g. from NTP."""
+    global _playing, _stop_flag
+    if _playing or protocol not in timecode.ENCODERS:
+        return False
+    _playing = True
+    _stop_flag = False
+    _thread.start_new_thread(
+        _transmit_thread, (protocol, frame_epoch_s, frame_start_ticks_us, freq_offset_hz))
+    return True
 
 
 def start(protocol, start_epoch_s, freq_offset_hz=0):
-    """Start transmitting `protocol` on the second core, beginning at
-    `start_epoch_s` (UTC epoch seconds). No-op if already transmitting.
-
-    freq_offset_hz (default 0, meaning transmit on the real frequency)
-    shifts the carrier for reception testing — see _transmit_thread's
-    docstring for why you'd want this.
-
-    Captures the (monotonic tick, wall clock) anchor pair right here,
-    synchronously, before handing off to the transmit thread — call this
-    as early as possible after the moment you want to treat as "now"
-    (e.g. immediately after a keypress or as soon as a request arrives),
-    since everything after this call inherits whatever delay happened
-    before it."""
-    if _playing:
-        return False
-    if protocol not in timecode.ENCODERS:
-        return False
+    """Original API: treat 'right now' as UTC epoch second start_epoch_s and
+    begin at the next frame boundary (frames must start on the minute, or
+    the clock would decode a time that's off by however many seconds the
+    start was misaligned)."""
     anchor_ticks_us = utime.ticks_us()
-    anchor_epoch_s = utime.time()
-    _thread.start_new_thread(
-        _transmit_thread,
-        (protocol, start_epoch_s, anchor_ticks_us, anchor_epoch_s, freq_offset_hz),
-    )
-    return True
+    anchor_epoch_s = int(start_epoch_s)
+    frame_epoch = next_frame_boundary(protocol, anchor_epoch_s)
+    frame_start_us = utime.ticks_add(
+        anchor_ticks_us, (frame_epoch - anchor_epoch_s) * 1_000_000)
+    return start_at(protocol, frame_epoch, frame_start_us, freq_offset_hz)
