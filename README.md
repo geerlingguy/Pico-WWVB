@@ -37,7 +37,7 @@ Wind one continuous piece of wire into 20–30 turns about 2–3 cm across (arou
    mpremote reset
    ```
 
-On boot the Pico joins Wi-Fi, syncs over NTP, and starts transmitting at the next minute boundary. It re-syncs hourly to correct crystal drift. Watch progress on the serial console (`mpremote repl`), or open `http://longwave-pico.local/` for a JSON status page.
+On boot the Pico joins Wi-Fi, syncs over NTP, and starts transmitting at the next minute boundary. It re-syncs hourly to correct crystal drift. Watch progress on the serial console with `mpremote repl`.
 
 Then put the clock into its sync mode (or power-cycle it) with the loop against it. Most clocks set themselves within 3–10 minutes.
 
@@ -49,9 +49,6 @@ Then put the clock into its sync mode (or power-cycle it) with the loop against 
 | `NTP_SERVER` | `"pool.ntp.org"` | NTP server to sync from |
 | `NTP_RESYNC_S` | `3600` | Seconds between NTP re-syncs |
 | `TX_PINS` | `(0, 1)` | Two consecutive GPIOs for differential drive, or `(0,)` for GP0 → 220 Ω → loop → GND |
-| `TX_HOURS_UTC` | `None` | Hours (UTC) to transmit, e.g. `(5, 6, 7, 8, 9, 10, 11)` for overnight in US Central; `None` = 24/7 |
-
-If `WIFI_SSID` is left empty, the Pico instead opens a Wi-Fi network named `LongwavePico`; join it from your phone and open `http://192.168.4.1` to set the time and start transmitting.
 
 ## Testing
 
