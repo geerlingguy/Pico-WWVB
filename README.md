@@ -4,6 +4,14 @@
 
 Sets radio-controlled ("atomic") clocks indoors, where the real WWVB signal from Colorado doesn't reach. A Raspberry Pi Pico 2 W (or Pico W) gets the time over Wi-Fi and transmits a 60 kHz WWVB signal through a small wire loop placed next to the clock.
 
+## Alternatives
+
+There are many. Before this project, I looked into [txtempus](https://github.com/hzeller/txtempus), which runs on a Pi Zero, [WatchTower](https://github.com/emmby/WatchTower) on ESP32, or [WWVB Simulator](https://www.instructables.com/WWVB-Simulator/) on STM32.
+
+There's also a webapp you can just play on your phone or computer speakers called [Time Station Emulator](https://timestation.pages.dev).
+
+This project doesn't intend to replace any of those, it's just my own way to scratch an itch. If it's useful to you, too? Great!
+
 ## Parts
 
 - Raspberry Pi Pico 2 W or Pico W
