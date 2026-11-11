@@ -16,7 +16,7 @@ CARRIER_HZ = 60_000
 _pins = (machine.Pin(0), machine.Pin(1))  # physical pins 1 and 2
 
 _running = False
-_position = None  # (epoch_s, ticks_us) of the current frame's start
+_position = None  # (epoch_s, ticks_us, frame) of the current minute
 _adjust_us = 0    # applied at the next frame boundary
 
 
@@ -54,8 +54,9 @@ def _run(epoch, start):
         # 2 instructions per cycle; 120 kHz divides 150 MHz exactly on a Pico 2.
         rp2.StateMachine(0, _carrier, freq=2 * CARRIER_HZ, set_base=_pins[0]).active(1)
         while True:
-            _position = (epoch, start)
-            for i, low_ms in enumerate(timecode.frame(epoch)):
+            frame = timecode.frame(epoch)
+            _position = (epoch, start, frame)
+            for i, low_ms in enumerate(frame):
                 second = utime.ticks_add(start, i * 1_000_000)
                 _off()
                 _wait_until(utime.ticks_add(second, low_ms * 1000))
