@@ -2,6 +2,8 @@
 
 # Pico WWVB
 
+[![CI](https://github.com/geerlingguy/Pico-WWVB/actions/workflows/ci.yml/badge.svg)](https://github.com/geerlingguy/Pico-WWVB/actions/workflows/ci.yml)
+
 Sets radio-controlled ("atomic") clocks indoors, where the real WWVB signal from Colorado doesn't reach. A Raspberry Pi Pico 2 W (or Pico W) gets the time over Wi-Fi and transmits a 60 kHz WWVB signal through a small antenna placed next to the clock.
 
 ## Alternatives
