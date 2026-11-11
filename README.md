@@ -53,7 +53,7 @@ Start close, then move the antenna away to find out how much range you have. If 
 
 ## Setup
 
-First, make sure you have [`mpremote`](https://docs.micropython.org/en/latest/reference/mpremote.html) installed on your computer. Then:
+First, install [uv](https://docs.astral.sh/uv/getting-started/installation/) (on a Mac, `brew install uv`). It runs [`mpremote`](https://docs.micropython.org/en/latest/reference/mpremote.html) with `uvx`, so there's nothing else to install. Then:
 
 1. Plug your Pico into your computer while holding down the 'BOOT' button. This will mount it as `RPI-RP2`.
 1. Flash MicroPython for the [Pico 2 W](https://micropython.org/download/RPI_PICO2_W/) or [Pico W](https://micropython.org/download/RPI_PICO_W/) by copying the respective `UF2` file to the `RPI-RP2` mount. After the copy is finished, it will unmount and is ready for your code.
@@ -61,11 +61,11 @@ First, make sure you have [`mpremote`](https://docs.micropython.org/en/latest/re
 1. Copy the files over and reset the Pico:
 
    ```
-   mpremote cp main.py transmitter.py timecode.py ntp.py config.py :
-   mpremote reset
+   uvx mpremote cp main.py transmitter.py timecode.py ntp.py config.py :
+   uvx mpremote reset
    ```
 
-The Pico starts transmitting at the next full minute and re-syncs with NTP every hour. Run `mpremote repl` to watch its progress.
+The Pico starts transmitting at the next full minute and re-syncs with NTP every hour. To watch its progress, run `uvx mpremote repl` and press Ctrl-D to restart it with the output showing (Ctrl-] exits).
 
 The Pico's onboard LED shows its status:
 
@@ -79,7 +79,7 @@ Then start a manual sync on the clock (or pull and reinsert its battery) with th
 
 ## Testing
 
-`python3 test_wwvb.py` checks the generated time code against Python's `datetime` for two years of minutes, including the DST changeovers.
+`uv run test_wwvb.py` checks the generated time code against Python's `datetime` for two years of minutes, including the DST changeovers.
 
 ## License
 
