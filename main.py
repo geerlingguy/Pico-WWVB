@@ -9,6 +9,7 @@ import network
 
 import config
 import ntp
+import timecode
 import transmitter
 
 RESYNC_MS = 3_600_000  # hourly, to cancel crystal drift
@@ -17,6 +18,26 @@ RETRY_MS = 30_000
 led = machine.Pin("LED", machine.Pin.OUT)
 led_on = None
 failed = False
+shown = None  # (epoch, second) last printed to the console
+DST = {(0, 0): "standard time", (1, 1): "DST", (1, 0): "DST starts today", (0, 1): "DST ends today"}
+
+
+def log(*args):
+    if shown and shown[1] != 59:
+        print()  # end the time code line first
+    print(*args)
+
+
+def show(epoch, sec, frame):
+    # One symbol per transmitted second; the minute's decoded time after :59.
+    global shown
+    shown = (epoch, sec)
+    print({200: "0", 500: "1", 800: "M"}[frame[sec]], end="")
+    if sec == 59:
+        mn, hr, day, year, dst = timecode.decode(frame)
+        print("  %02d:%02d UTC, day %d of %d, %s" % (hr, mn, day, year, DST[dst]))
+    elif frame[sec] == 800:
+        print(" ", end="")
 
 
 def blink(_):
@@ -24,9 +45,11 @@ def blink(_):
     global led_on
     pos = transmitter.position()
     if pos:
-        _, start, frame = pos
+        epoch, start, frame = pos
         ms = time.ticks_diff(time.ticks_us(), start) // 1000
         on = ms < 0 or (ms < 60_000 and ms % 1000 < frame[ms // 1000])
+        if 0 <= ms < 60_000 and shown != (epoch, ms // 1000):
+            show(epoch, ms // 1000, frame)
     else:
         on = not failed or time.ticks_ms() // 100 % 2 == 0
     if on != led_on:  # the LED is on the Wi-Fi chip, so skip redundant writes
@@ -44,11 +67,11 @@ def wifi_connect():
         return
     wlan.active(True)
     wlan.config(pm=network.WLAN.PM_NONE)  # power saving adds NTP jitter
-    print("Connecting to", config.WIFI_SSID)
+    log("Connecting to", config.WIFI_SSID)
     wlan.connect(config.WIFI_SSID, config.WIFI_PASSWORD)
     for _ in range(30):
         if wlan.isconnected():
-            print("Wi-Fi connected:", wlan.ifconfig()[0])
+            log("Wi-Fi connected:", wlan.ifconfig()[0])
             return
         time.sleep(1)
     raise OSError("Wi-Fi connect timed out")
@@ -61,11 +84,11 @@ def sync():
         wifi_connect()
         anchor = ntp.query(config.NTP_SERVER)
     except Exception as e:
-        print("NTP sync failed:", e)
+        log("NTP sync failed:", e)
         failed = True
         return None
     failed = False
-    print("NTP sync:", fmt(ntp.now_us(anchor) // 1_000_000), "(rtt %.1f ms)" % (anchor[2] / 1000))
+    log("NTP sync:", fmt(ntp.now_us(anchor) // 1_000_000), "(rtt %.1f ms)" % (anchor[2] / 1000))
     return anchor
 
 
@@ -73,7 +96,7 @@ def start(anchor):
     # Next minute at least 0.2 s away, leaving time to set up the PIO.
     epoch = ((ntp.now_us(anchor) + 200_000) // 60_000_000 + 1) * 60
     transmitter.start(epoch, ntp.ticks_at(anchor, epoch * 1_000_000))
-    print("Transmitting WWVB from", fmt(epoch))
+    log("Transmitting WWVB from", fmt(epoch))
 
 
 def correct_drift(anchor, position):
@@ -81,7 +104,7 @@ def correct_drift(anchor, position):
     epoch, ticks, _ = position
     delta = time.ticks_diff(ntp.ticks_at(anchor, epoch * 1_000_000), ticks)
     transmitter.adjust(delta)
-    print("Drift correction: %+.1f ms" % (delta / 1000))
+    log("Drift correction: %+.1f ms" % (delta / 1000))
 
 
 def main():

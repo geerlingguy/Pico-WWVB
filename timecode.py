@@ -66,3 +66,10 @@ def frame(epoch_s):
     bits[57] = us_dst(day + 1)  # DST at end of this UTC day
     bits[58] = us_dst(day)      # DST at start of this UTC day
     return [800 if s in MARKERS else 500 if bits[s] else 200 for s in range(60)]
+
+
+def decode(frame):
+    """(minute, hour, day of year, year, DST bits 57 and 58) read back from a frame."""
+    bits = [int(ms == 500) for ms in frame]
+    val = lambda fields: sum(w for s, w in fields if bits[s])
+    return val(MINUTE), val(HOUR), val(DAY_OF_YEAR), 2000 + val(YEAR), (bits[57], bits[58])

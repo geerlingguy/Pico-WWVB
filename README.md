@@ -103,6 +103,12 @@ Add up the weights of the seconds that blink long. For example, minute 25 is lon
 
 The rest of the minute carries the day of year, year, leap year, and daylight saving time. NIST's [WWVB time code format](https://www.nist.gov/pml/time-and-frequency-division/time-distribution/radio-station-wwvb/wwvb-time-code-format) page has the full layout.
 
+The console (`uvx mpremote repl`) shows the same code as it's sent, one symbol per second (`0`, `1`, or `M` for a marker), then the time decoded from those bits at the end of each minute:
+
+```
+M 10100011M 001000001M 001100001M 010100000M 000000010M 011000000M  21:53 UTC, day 315 of 2026, standard time
+```
+
 ## Testing
 
 `uv run test_wwvb.py` checks the generated time code against Python's `datetime` for two years of minutes, including the DST changeovers.
