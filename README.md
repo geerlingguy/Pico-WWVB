@@ -74,10 +74,34 @@ The Pico's onboard LED shows its status:
 | LED | Meaning |
 | --- | --- |
 | Solid | Connecting to Wi-Fi and syncing with NTP, then waiting for the next full minute |
-| Short flash every second | Transmitting; each flash marks the start of a transmitted second |
+| Short and long blinks | Transmitting; the LED blinks out the WWVB time code (see below) |
 | Fast blink | Wi-Fi or NTP sync failed (or `WIFI_SSID` isn't set); it retries every 30 seconds |
 
 Then start a manual sync on the clock (or pull and reinsert its battery) with the antenna in place. Most clocks set themselves within 3–10 minutes.
+
+### Reading the time code from the LED
+
+While transmitting, the LED is lit whenever the 60 kHz carrier is at reduced power. WWVB reduces it at the start of every second, and how long it stays reduced encodes one bit:
+
+| Blink | Meaning |
+| --- | --- |
+| 0.2 s | 0 |
+| 0.5 s | 1 |
+| 0.8 s | Marker, every 10 seconds |
+
+Two markers in a row mean a new minute: the second one is second :00. Each minute's blinks then spell out the UTC time that minute started, in binary-coded decimal:
+
+| Second | :01 | :02 | :03 | :04 | :05 | :06 | :07 | :08 |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| Minute | 40 | 20 | 10 | – | 8 | 4 | 2 | 1 |
+
+| Second | :12 | :13 | :14 | :15 | :16 | :17 | :18 |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| Hour | 20 | 10 | – | 8 | 4 | 2 | 1 |
+
+Add up the weights of the seconds that blink long. For example, minute 25 is long blinks at :02 (20), :06 (4), and :08 (1). The seconds marked – are always short.
+
+The rest of the minute carries the day of year, year, leap year, and daylight saving time. NIST's [WWVB time code format](https://www.nist.gov/pml/time-and-frequency-division/time-distribution/radio-station-wwvb/wwvb-time-code-format) page has the full layout.
 
 ## Testing
 

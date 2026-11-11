@@ -20,12 +20,13 @@ failed = False
 
 
 def blink(_):
-    # Solid: syncing. 100 ms flash each transmitted second: OK. Fast blink: sync failed.
+    # Solid: syncing. Lit while the carrier is reduced: transmitting. Fast blink: sync failed.
     global led_on
     pos = transmitter.position()
     if pos:
-        d = time.ticks_diff(time.ticks_us(), pos[1])
-        on = d < 0 or d // 1000 % 1000 < 100
+        _, start, frame = pos
+        ms = time.ticks_diff(time.ticks_us(), start) // 1000
+        on = ms < 0 or (ms < 60_000 and ms % 1000 < frame[ms // 1000])
     else:
         on = not failed or time.ticks_ms() // 100 % 2 == 0
     if on != led_on:  # the LED is on the Wi-Fi chip, so skip redundant writes
@@ -77,7 +78,7 @@ def start(anchor):
 
 def correct_drift(anchor, position):
     # How far the current minute's actual start is from where NTP says it should be.
-    epoch, ticks = position
+    epoch, ticks, _ = position
     delta = time.ticks_diff(ntp.ticks_at(anchor, epoch * 1_000_000), ticks)
     transmitter.adjust(delta)
     print("Drift correction: %+.1f ms" % (delta / 1000))
@@ -85,7 +86,7 @@ def correct_drift(anchor, position):
 
 def main():
     global failed
-    timer = machine.Timer(period=50, callback=blink)
+    timer = machine.Timer(period=20, callback=blink)
     if not config.WIFI_SSID:
         failed = True
         raise SystemExit("Set WIFI_SSID and WIFI_PASSWORD in config.py")
