@@ -67,6 +67,14 @@ First, make sure you have [`mpremote`](https://docs.micropython.org/en/latest/re
 
 The Pico starts transmitting at the next full minute and re-syncs with NTP every hour. Run `mpremote repl` to watch its progress.
 
+The Pico's onboard LED shows its status:
+
+| LED | Meaning |
+| --- | --- |
+| Solid | Connecting to Wi-Fi and syncing with NTP, then waiting for the next full minute |
+| Short flash every second | Transmitting; each flash marks the start of a transmitted second |
+| Fast blink | Wi-Fi or NTP sync failed (or `WIFI_SSID` isn't set); it retries every 30 seconds |
+
 Then start a manual sync on the clock (or pull and reinsert its battery) with the antenna in place. Most clocks set themselves within 3–10 minutes.
 
 ## Testing

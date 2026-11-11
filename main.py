@@ -4,6 +4,7 @@ progress prints to the USB serial console (`mpremote repl`).
 """
 
 import time
+import machine
 import network
 
 import config
@@ -12,6 +13,24 @@ import transmitter
 
 RESYNC_MS = 3_600_000  # hourly, to cancel crystal drift
 RETRY_MS = 30_000
+
+led = machine.Pin("LED", machine.Pin.OUT)
+led_on = None
+failed = False
+
+
+def blink(_):
+    # Solid: syncing. 100 ms flash each transmitted second: OK. Fast blink: sync failed.
+    global led_on
+    pos = transmitter.position()
+    if pos:
+        d = time.ticks_diff(time.ticks_us(), pos[1])
+        on = d < 0 or d // 1000 % 1000 < 100
+    else:
+        on = not failed or time.ticks_ms() // 100 % 2 == 0
+    if on != led_on:  # the LED is on the Wi-Fi chip, so skip redundant writes
+        led.value(on)
+        led_on = on
 
 
 def fmt(epoch_s):
@@ -36,12 +55,15 @@ def wifi_connect():
 
 def sync():
     """Fresh NTP anchor, or None on failure."""
+    global failed
     try:
         wifi_connect()
         anchor = ntp.query(config.NTP_SERVER)
     except Exception as e:
         print("NTP sync failed:", e)
+        failed = True
         return None
+    failed = False
     print("NTP sync:", fmt(ntp.now_us(anchor) // 1_000_000), "(rtt %.1f ms)" % (anchor[2] / 1000))
     return anchor
 
@@ -62,7 +84,10 @@ def correct_drift(anchor, position):
 
 
 def main():
+    global failed
+    timer = machine.Timer(period=50, callback=blink)
     if not config.WIFI_SSID:
+        failed = True
         raise SystemExit("Set WIFI_SSID and WIFI_PASSWORD in config.py")
     while True:
         anchor = sync()
