@@ -26,11 +26,13 @@ def dst(t):
 t = dt.datetime(2026, 1, 1, tzinfo=dt.timezone.utc)
 n = 0
 while t.year < 2028:
-    got = decode(timecode.frame(int(t.timestamp())))
+    frame = timecode.frame(int(t.timestamp()))
+    got = decode(frame)
     midnight = t.replace(hour=0, minute=0)
     want = (t.minute, t.hour, t.timetuple().tm_yday, t.year % 100,
             int(t.year % 4 == 0), dst(midnight + dt.timedelta(days=1)), dst(midnight))
     assert got == want, (t, got, want)
+    assert timecode.decode(frame) == (*want[:3], 2000 + want[3], want[5:]), t
     n += 1
     t += dt.timedelta(minutes=97)
 
