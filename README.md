@@ -57,7 +57,7 @@ First, make sure you have [`mpremote`](https://docs.micropython.org/en/latest/re
 
 1. Plug your Pico into your computer while holding down the 'BOOT' button. This will mount it as `RPI-RP2`.
 1. Flash MicroPython for the [Pico 2 W](https://micropython.org/download/RPI_PICO2_W/) or [Pico W](https://micropython.org/download/RPI_PICO_W/) by copying the respective `UF2` file to the `RPI-RP2` mount. After the copy is finished, it will unmount and is ready for your code.
-1. Put your Wi-Fi name and password in `config.py`. Optionally, change `NTP_SERVER` to a server on your network.
+1. Copy `example.config.py` to `config.py`, then put your Wi-Fi name and password in `config.py`. Optionally, change `NTP_SERVER` to a server on your network.
 1. Copy the files over and reset the Pico:
 
    ```
