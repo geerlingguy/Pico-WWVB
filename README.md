@@ -53,6 +53,18 @@ The clock has its own small ferrite rod antenna inside, usually lying along one 
 
 Start close, then move the antenna away to find out how much range you have. If the clock won't sync, rotate or slide the antenna before moving it closer.
 
+## Legality (US)
+
+In the US, a home-built, low-power 60 kHz transmitter like this one should fall under FCC Part 15:
+
+- 60 kHz isn't one of the [restricted bands](https://www.ecfr.gov/current/title-47/chapter-I/subchapter-A/part-15/subpart-C/section-15.205) (the nearest is 90–110 kHz).
+- [§ 15.209](https://www.ecfr.gov/current/title-47/chapter-I/subchapter-A/part-15/subpart-C/section-15.209) allows up to 40 µV/m at 300 m at 60 kHz (about 0.4 V/m at 3 m). A Pico pin driving a small loop is far below that.
+- [§ 15.23](https://www.ecfr.gov/current/title-47/chapter-I/subchapter-A/part-15/subpart-A/section-15.23) exempts home-built devices (five or fewer, not marketed, for personal use) from equipment authorization.
+
+It must not cause harmful interference ([§ 15.5](https://www.ecfr.gov/current/title-47/chapter-I/subchapter-A/part-15/subpart-A/section-15.5)), so keep the antenna small and only as close to the clock as you need. Other countries have their own rules.
+
+This isn't legal advice.
+
 ## Setup
 
 First, install [uv](https://docs.astral.sh/uv/getting-started/installation/) (on a Mac, `brew install uv`). It runs [`mpremote`](https://docs.micropython.org/en/latest/reference/mpremote.html) with `uvx`, so there's nothing else to install. Then:
