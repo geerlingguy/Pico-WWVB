@@ -75,7 +75,7 @@ First, install [uv](https://docs.astral.sh/uv/getting-started/installation/) (on
 
 1. Plug your Pico into your computer while holding down the 'BOOT' button. This will mount it as `RPI-RP2`.
 1. Flash MicroPython for the [Pico 2 W](https://micropython.org/download/RPI_PICO2_W/) or [Pico W](https://micropython.org/download/RPI_PICO_W/) by copying the respective `UF2` file to the `RPI-RP2` mount. After the copy is finished, it will unmount and is ready for your code.
-1. Copy `example.config.py` to `config.py`, then put your Wi-Fi name and password in `config.py`. Optionally, change `NTP_SERVER` to a server on your network.
+1. Copy `example.config.py` to `config.py`, then put your Wi-Fi name and password in `config.py`. Optionally, change `NTP_SERVER` to a server on your network, or set `PHASE_MODULATION = True` (see [Phase modulation](#phase-modulation)).
 1. Copy the files over and reset the Pico:
 
    ```
@@ -125,9 +125,17 @@ The console (`uvx mpremote repl`) shows the same code as it's sent, one symbol p
 M 10100011M 001000001M 001100001M 010100000M 000000010M 011000000M  21:53 UTC, day 315 of 2026, standard time
 ```
 
+## Phase modulation
+
+Since 2012, WWVB has also sent a phase-modulated (BPSK) time code on the same carrier: the carrier is inverted for a 1 bit and left alone for a 0. Clocks that receive it, like the La Crosse UltrAtomic (EverSet ES100 receiver), sync in places where amplitude-only clocks can't. NIST's [Enhanced WWVB Broadcast Format](https://www.nist.gov/document/nist-enhanced-wwvb-broadcast-format-101-2013-11-06pdf) has the details.
+
+Set `PHASE_MODULATION = True` in `config.py` to send it. Amplitude-only clocks ignore the phase, so they keep working either way.
+
+This sends the normal 1-minute phase frame every minute; WWVB's 6-minute frames (minutes 10–15 and 40–45) and leap second warnings aren't implemented.
+
 ## Testing
 
-`uv run test_wwvb.py` checks the generated time code against Python's `datetime` for two years of minutes, including the DST changeovers.
+`uv run test_wwvb.py` checks the generated time code against Python's `datetime` for two years of minutes, including the DST changeovers, and checks the phase time code against the [wwvb](https://pypi.org/project/wwvb/) package.
 
 ## License
 
