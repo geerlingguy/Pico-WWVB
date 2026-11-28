@@ -73,3 +73,32 @@ def decode(frame):
     bits = [int(ms == 500) for ms in frame]
     val = lambda fields: sum(w for s, w in fields if bits[s])
     return val(MINUTE), val(HOUR), val(DAY_OF_YEAR), 2000 + val(YEAR), (bits[57], bits[58])
+
+
+# Phase (BPSK) time code, from NIST's Enhanced WWVB Broadcast Format rev 1.01.
+SYNC_T = (0, 0, 1, 1, 1, 0, 1, 1, 0, 1, 0, 0, 0)  # seconds 0-12
+TIME_PAR = (  # time[] bits XORed into time_par[4] ... time_par[0]
+    (25, 22, 20, 19, 16, 15, 14, 13, 12, 8, 7, 5, 4, 3, 1),
+    (24, 21, 19, 18, 15, 14, 13, 12, 11, 7, 6, 4, 3, 2, 0),
+    (25, 23, 22, 19, 18, 17, 16, 15, 11, 10, 8, 7, 6, 4, 2),
+    (24, 22, 21, 18, 17, 16, 15, 14, 10, 9, 7, 6, 5, 3, 1),
+    (23, 21, 20, 17, 16, 15, 14, 13, 9, 8, 6, 5, 4, 2, 0),
+)
+DST_LS = {(0, 0): 0b01000, (1, 0): 0b10110, (1, 1): 0b00011, (0, 1): 0b10101}  # no leap second
+DST_NEXT = 0b011011  # US rules: 2nd Sunday in March, 1st Sunday in November, 2:00
+
+
+def pm_frame(epoch_s):
+    """Phase for each second of the minute starting at epoch_s: 0 = normal,
+    1 = inverted. Always the normal 1-minute frame, even in minutes 10-15 and
+    40-45 when WWVB sends its 6-minute frame instead. Reserved :39 and the
+    notice bit (:49) are 1, matching the wwvb package."""
+    t = (epoch_s - 946684800) // 60  # minutes since 2000-01-01 00:00 UTC
+    bit = lambda v, i: v >> i & 1
+    day = epoch_s // 86400
+    ls = DST_LS[(us_dst(day + 1), us_dst(day))]
+    f = list(SYNC_T) + [sum(bit(t, i) for i in eq) & 1 for eq in TIME_PAR]
+    f += [bit(t, 25), bit(t, 0)] + [bit(t, i) for i in range(24, 15, -1)] + [0]
+    f += [bit(t, i) for i in range(15, 6, -1)] + [1] + [bit(t, i) for i in range(6, -1, -1)]
+    f += [bit(ls, 4), bit(ls, 3), 1, bit(ls, 2), bit(ls, 1), bit(ls, 0)]
+    return f + [bit(DST_NEXT, i) for i in range(5, -1, -1)] + [0]

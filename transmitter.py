@@ -2,7 +2,8 @@
 transmitter.py — 60 kHz WWVB carrier on GP0 and GP1, keyed by timecode.py.
 
 A PIO state machine toggles the two pins in antiphase. Keying the carrier
-off hands the pins back to plain GPIO, driven low.
+off hands the pins back to plain GPIO, driven low. The state machine keeps
+running while keyed off, so the carrier phase stays continuous.
 """
 
 import rp2
@@ -47,18 +48,24 @@ def _wait_until(deadline):
             utime.sleep_us(min(left - 1000, 5000))  # spin the last ~1 ms
 
 
-def _run(epoch, start):
+def _run(epoch, start, phase_mod):
     global _running, _position, _adjust_us
     try:
         _off()
         # 2 instructions per cycle; 120 kHz divides 150 MHz exactly on a Pico 2.
-        rp2.StateMachine(0, _carrier, freq=2 * CARRIER_HZ, set_base=_pins[0]).active(1)
+        sm = rp2.StateMachine(0, _carrier, freq=2 * CARRIER_HZ, set_base=_pins[0])
+        sm.active(1)
+        phase = 0
         while True:
             frame = timecode.frame(epoch)
+            pm = timecode.pm_frame(epoch) if phase_mod else None
             _position = (epoch, start, frame)
             for i, low_ms in enumerate(frame):
                 second = utime.ticks_add(start, i * 1_000_000)
                 _off()
+                if pm and pm[i] != phase:
+                    sm.exec("nop()")  # stalls the carrier half a cycle: 180°
+                    phase = pm[i]
                 _wait_until(utime.ticks_add(second, low_ms * 1000))
                 _on()
                 _wait_until(utime.ticks_add(second, 1_000_000))
@@ -73,12 +80,13 @@ def _run(epoch, start):
         _running = False
 
 
-def start(epoch, ticks_us):
+def start(epoch, ticks_us, phase_mod=False):
     """Start sending, with the minute at UTC epoch second `epoch` beginning
-    at ticks_us(). Runs on the second core."""
+    at ticks_us(). Runs on the second core. `phase_mod` adds the phase
+    (BPSK) time code."""
     global _running
     _running = True
-    _thread.start_new_thread(_run, (epoch, ticks_us))
+    _thread.start_new_thread(_run, (epoch, ticks_us, phase_mod))
 
 
 def running():

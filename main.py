@@ -95,8 +95,9 @@ def sync():
 def start(anchor):
     # Next minute at least 0.2 s away, leaving time to set up the PIO.
     epoch = ((ntp.now_us(anchor) + 200_000) // 60_000_000 + 1) * 60
-    transmitter.start(epoch, ntp.ticks_at(anchor, epoch * 1_000_000))
-    log("Transmitting WWVB from", fmt(epoch))
+    pm = getattr(config, "PHASE_MODULATION", False)
+    transmitter.start(epoch, ntp.ticks_at(anchor, epoch * 1_000_000), pm)
+    log("Transmitting WWVB%s from" % (" with phase modulation" if pm else ""), fmt(epoch))
 
 
 def correct_drift(anchor, position):
